@@ -100,6 +100,56 @@ somewhere else:
 WINDOWS_SDK_ROOT=/path/to/sdk/c ./native/build-win0-doom.sh
 ```
 
+## automated vm image build
+
+`tools/build-vm-image.sh` builds a fresh qcow2 without modifying an existing
+windows disk. it requires two microsoft-sourced inputs:
+
+- the official validationos iso, which supplies the bootable win4 vhdx
+- a `GenImage`-generated **runlevel-0** wim from the same validationos build
+
+the second input is mandatory. microsoft's stock vhdx does not contain the
+Win0-N packages or even `ccs.exe`, `CloudCoreInit.exe`, and the win0 api-set
+schema. changing registry values on that stock image produces an unbootable or
+empty pseudo-win0 environment; it cannot manufacture the omitted packages.
+
+```bash
+./tools/build-vm-image.sh \
+  /path/to/official-validationos.iso \
+  /path/to/generated-runlevel-0.wim \
+  ./dist/win0-doom.qcow2 \
+  /path/to/doom1.wad
+```
+
+the builder compiles and test-signs the current artifacts, converts the
+official vhdx, asks pristine win4 to construct a target-specific bcd using
+windows-native tools, overlays the generated wim, installs the driver/game/wad,
+checks the qcow2, and writes a sha-256 file. it refuses to overwrite an existing
+output and preserves a failed partial image for diagnosis.
+
+runlevel 0 still starts microsoft's `ccs.exe` as its required initial process.
+the builder sets the session manager's `CcsCommand` value to
+`\SystemRoot\system32\win0doom.exe`; ccs completes session initialization and
+then launches doom automatically. replacing `NtInitialUserProcess` or the ccs
+binary itself causes `SESSION1_INITIALIZATION_FAILED (0x6d)`. deleting
+`CcsCommand` from win4 or an offline registry editor restores the normal ccs
+prompt.
+
+host-side dependencies are qemu with kvm and nbd support, ovmf, ntfs-3g,
+wimlib, hivex, `socat`, and the build dependencies above. the helper vm uses
+2 gib of ram; the resulting image can be launched with 8 gib or more.
+
+neither the generated wim, validationos binaries, vm image, nor doom wad belongs
+in this repository. whether microsoft permits redistribution of a finished
+validationos disk must be established separately before publishing one on
+google drive, proton drive, or a release page. the safe public workflow is
+bring-your-own microsoft inputs plus a legally obtained wad.
+
+`tools/deploy-vm.sh` creates a compressed, checked rollback image before
+replacing only the win0 doom payload files in an already-generated runlevel-0
+disk. `tools/rollback-vm.sh` restores that backup while preserving the displaced
+image.
+
 ## giant warning label
 
 this is a qemu-only research prototype, not a general windows display driver.

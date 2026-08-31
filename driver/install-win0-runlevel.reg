@@ -1,0 +1,24 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Control\RunLevels]
+"0"="\\SystemRoot\\system32\\ccs.exe"
+"1"="CloudCoreInit.exe"
+"DefaultKmode"=hex(2):5c,00,53,00,79,00,73,00,74,00,65,00,6d,00,52,00,6f,00,6f,00,74,00,5c,00,53,00,79,00,73,00,74,00,65,00,6d,00,33,00,32,00,5c,00,77,00,69,00,6e,00,33,00,32,00,6b,00,2e,00,73,00,79,00,73,00,00,00
+"DefaultNtInitialUserProcess"="\\SystemRoot\\system32\\smss.exe"
+"DefaultNumberOfInitialSessions"=dword:00000002
+"DefaultS0InitialCommand"="wininit.exe"
+"NtInitialUserProcess"="\\SystemRoot\\system32\\ccs.exe"
+"NumberOfInitialSessions"=dword:00000001
+"S0InitialCommand"="CloudCoreInit.exe"
+"TargetRL"=dword:00000000
+"Win01"=dword:00000001
+
+[HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Control\Session Manager]
+"CcsCommand"="\\SystemRoot\\system32\\win0doom.exe"
+
+[HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Control\Session Manager\ApiSetSchemaExtensions]
+"BaseApiSetSchema"="apisetschema_win0.dll"
+
+[HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Control\Session Manager\ApiSetSchemaExtensions\f911f154-081b-49de-bbbd-a0dd908085bb]
+"FileName"="f911f154-081b-49de-bbbd-a0dd908085bb_win0-n.dll"
+"Name"="Win0-N"

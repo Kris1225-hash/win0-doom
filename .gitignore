@@ -8,6 +8,7 @@
 # Build products
 /driver/build/
 /native/build/
+/dist/
 *.obj
 *.exe
 *.sys
@@ -41,4 +42,3 @@
 .vscode/
 *~
 .DS_Store
-
