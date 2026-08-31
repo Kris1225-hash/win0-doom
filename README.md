@@ -21,9 +21,10 @@ standard-vga aperture.
   `ntdll.dll`
 - doom finds the wad, initializes successfully, enters its demo loop, and
   renders live game frames in validationos runlevel 0
-- keyboard scan-code translation and the user/kernel ioctl are implemented,
-  but the in-progress kernel reader is not complete yet, so the last proven vm
-  build remains watchable rather than playable
+- the driver is also a keyboard-class upper filter: it mirrors raw scan-code
+  records into a spinlock-protected ring while forwarding every record to ccs
+- menus, key presses, key releases, movement, and firing have been proven in a
+  clean runlevel-0 boot; doom is playable
 
 the exact state of the keyboard work, including the currently expected build
 failure and the next changes, is recorded in [`NEXT.md`](NEXT.md).
@@ -33,30 +34,37 @@ not provide the normal per-process `C:` dos-device mapping, so the platform
 layer tries `\\GLOBAL??\\C:` and the native `\\Device\\HarddiskVolume*`
 names, then caches the volume which contains the wad.
 
-## next milestone: make it playable
+## keyboard input
 
-the next change will connect qemu keyboard input without depending on win32:
+runlevel 0 gives native applications no console or standard handles. directly
+opening `\\Device\\KeyboardClass*` from user mode is denied, while reading
+those devices from a kernel thread competes with ccs for the same input queue.
 
-1. finish the synchronous system-thread readers for
-   `\\Device\\KeyboardClass1` and `\\Device\\KeyboardClass0`
-2. shut those threads down safely when the driver unloads
-3. build, sign, and install the driver in the disposable win0 vm while keeping
-   the known-good framebuffer-only driver and qcow2 backup intact
-4. verify escape opens doom's menu, then verify movement, firing, menus, and
-   key releases
+the working design follows microsoft's
+[`kbfiltr`](https://github.com/microsoft/Windows-driver-samples/tree/main/input/kbfiltr)
+model. `Win0DoomDisplay` is registered before `kbdclass` in the keyboard setup
+class's `UpperFilters` value. it intercepts
+`IOCTL_INTERNAL_KEYBOARD_CONNECT`, substitutes a small service callback, copies
+each `KEYBOARD_INPUT_DATA` record into doom's ring, and immediately calls the
+original class callback. ccs therefore continues to receive normal input.
 
-sound remains disabled for now. it will be considered only after keyboard
-input is reliable; runlevel 0 does not provide the ordinary windows audio
-stack either.
+opening the driver's control device discards older ring contents. this keeps
+the command used to launch `win0doom.exe` from becoming doom input.
+
+sound remains disabled. runlevel 0 does not provide the ordinary windows audio
+stack, so audio will require another native/kernel bridge if implemented.
 
 ## layout
 
 - `native/win0-doom.c` — puredoom platform layer using native nt apis
 - `native/build-win0-doom.sh` — clang/lld native executable build
-- `driver/win0doom-display.c` — qemu stdvga framebuffer bridge
+- `driver/win0doom-display.c` — qemu stdvga framebuffer bridge and keyboard
+  class upper filter
 - `driver/build-driver.sh` — wdk kernel-driver build
 - `driver/install-win0doom-display.reg` — boot-start service definition
 - `native/driver-display-test.c` — full-screen gradient test client
+- `native/input-probe.c` — confirms win0 native processes have no usable
+  standard handles
 - `PureDOOM/` — pinned upstream puredoom submodule
 
 the other native programs are small probes which established what runlevel 0

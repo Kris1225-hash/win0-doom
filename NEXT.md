@@ -1,64 +1,75 @@
-# current checkpoint and next changes
+# keyboard development record
 
-this is an intentional work-in-progress checkpoint. commit `e511106` is the
-last fully proven state: doom boots and renders inside validationos runlevel 0,
-but it cannot receive keyboard input.
+doom is now playable in validationos runlevel 0. this file preserves the
+failed paths, the working design, and the exact proof so the same dead ends do
+not have to be rediscovered.
 
-## what is implemented in this checkpoint
+## observations
 
-- the native doom client polls a new nonblocking keyboard ioctl on the existing
-  display-driver handle
-- raw `KEYBOARD_INPUT_DATA` set-1 make/break records are translated into
-  puredoom keys, including escape, enter, arrows, wasd, control, alt, shift,
-  space, tab, backspace, function keys, and number keys
-- the display driver exposes that keyboard ioctl
-- the driver has a spinlock-protected 128-record keyboard ring buffer
-- the driver opens both qemu keyboard class devices from kernel mode and starts
-  one synchronous reader system thread per successfully opened device
+- the native process receives null console, stdin, stdout, and stderr handles
+- `NtReadFile` on the null standard-input handle returns
+  `STATUS_INVALID_HANDLE` (`0xc0000008`)
+- opening `\Device\KeyboardClass0` or `KeyboardClass1` from user mode returns
+  `STATUS_ACCESS_DENIED` (`0xc0000022`)
+- an asynchronous kernel `ZwReadFile` returned `STATUS_INVALID_PARAMETER`
+  (`0xc000000d`)
+- synchronous kernel reader threads could open keyboard-class devices, but
+  competed with ccs for their queues and did not reliably deliver input
+- terminating ccs from user mode was denied; a narrowly scoped experimental
+  kernel path which verified the target basename and terminated only ccs
+  immediately bugchecked with `CRITICAL_PROCESS_DIED` (`0xef`)
 
-## why the design changed
+the ccs termination experiment was removed. it is not part of the source or
+the installed driver.
 
-opening `\\Device\\KeyboardClass0` or `\\Device\\KeyboardClass1` directly from
-the runlevel-0 native process returned `STATUS_ACCESS_DENIED` (`0xc0000022`).
-moving the open into the kernel driver succeeded, but the first asynchronous
-`ZwReadFile` design returned `STATUS_INVALID_PARAMETER` (`0xc000000d`).
+## working architecture
 
-the replacement design therefore performs a synchronous blocking `ZwReadFile`
-on a dedicated kernel system thread for each keyboard class device. those
-threads copy official `KEYBOARD_INPUT_DATA` records into the ring buffer. the
-game thread only drains the ring through the ioctl, so puredoom's event queue
-still has a single producer in user mode.
+the display driver now also implements the standard wdm keyboard upper-filter
+pattern used by microsoft's `kbfiltr` sample:
 
-## known broken edge at this exact checkpoint
+1. the keyboard setup class loads `Win0DoomDisplay` before `kbdclass`
+2. pnp calls the driver's `AddDevice`, which attaches a filter device to each
+   keyboard stack
+3. the filter intercepts `IOCTL_INTERNAL_KEYBOARD_CONNECT`, saves the original
+   `CONNECT_DATA`, and substitutes `Win0DoomKeyboardServiceCallback`
+4. the callback runs at dispatch level, copies each `KEYBOARD_INPUT_DATA`
+   record into the driver's spinlock-protected ring, and calls the original
+   class callback unchanged
+5. ccs keeps receiving keyboard input, while doom drains its copy through
+   `IOCTL_WIN0DOOM_GET_KEYBOARD`
+6. opening the control device resets the ring read position so launch-command
+   keystrokes are not replayed into doom
 
-the source is halfway through the async-reader-to-system-thread conversion.
-`Win0DoomUnload` still references the removed `EventHandle` field, so
-`./driver/build-driver.sh` currently fails with two errors at that reference.
-this is documented deliberately instead of hiding a mid-surgery commit behind
-a misleading green status.
+the registry entry is in `driver/install-win0doom-display.reg`. it preserves
+`kbdclass` and inserts `Win0DoomDisplay` before it in the multi-string value.
 
-## next changes, in order
+## proven test
 
-1. replace the stale unload loop with orderly thread shutdown:
-   - set `StopKeyboardThreads`
-   - close each keyboard file handle so its blocking read returns
-   - wait for each system thread with `ZwWaitForSingleObject`
-   - close each thread handle
-2. initialize the spinlock, stop flag, and ring indexes in `DriverEntry`
-3. rebuild both the driver and native executable and inspect their imports
-4. preserve the last signed framebuffer-only driver, sign the new driver, and
-   install it only in the disposable qcow2 clone
-5. boot runlevel 0 and use qemu `sendkey esc` as the first proof: during doom's
-   demo loop, any received key should open the menu
-6. test arrows, wasd, control/fire, space/use, enter, escape, and make/break
-   behavior; only then call the port playable
+the final test used a clean validationos runlevel-0 boot and qemu keyboard
+injection:
 
-## recovery points which must remain untouched
+1. ccs remained alive and accepted the native path used to launch doom
+2. doom entered its attract demo without consuming the launch command
+3. escape opened the main menu
+4. enter selected new game, episode one, and the default skill
+5. holding w moved the player from the e1m1 spawn into the blue-floor room
+6. control fired the pistol; the muzzle flash rendered and ammo decreased
 
-- the original validationos qcow2 is not the test target
+the vm survived two cold boots with the filter installed and showed no
+bugcheck.
+
+## recovery points used during development
+
+- the original validationos qcow2 was never the filter test target
 - the disposable clone has a complete pre-driver qcow2 backup
-- the vm contains `win0doom-display.sys.pre-keyboard`, the known-good signed
-  framebuffer-only driver
+- the vm contains a pre-filter system hive and signed driver beside their live
+  files
+- a second driver backup preserves the first working filter before the
+  launch-input ring reset
 
-if the input driver crashes the vm, restore only the disposable clone or its
-known-good driver. do not modify the original validationos disk.
+## remaining work
+
+- add audio only if a small native/kernel bridge is worth the complexity
+- replace the hard-coded stdvga physical aperture with discovered resources
+- package test signing and deployment into a reproducible disposable-vm flow
+- test device removal and driver-unload paths beyond the normal boot-only use
