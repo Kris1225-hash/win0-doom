@@ -150,6 +150,34 @@ replacing only the win0 doom payload files in an already-generated runlevel-0
 disk. `tools/rollback-vm.sh` restores that backup while preserving the displaced
 image.
 
+### native windows builder
+
+windows can build the same image without qemu-nbd, ntfs-3g, hivex, or the
+temporary win4 helper vm. from an elevated powershell prompt:
+
+```powershell
+.\tools\build-vm-image.ps1 `
+  -GeneratedRunLevel0Wim C:\path\ValidationOS.wim `
+  -OutputVhdx C:\VMs\win0-doom.vhdx `
+  -DoomWad C:\path\doom1.wad
+```
+
+the script uses windows-native vhd mounting, diskpart, dism, `reg.exe`, and
+`bcdedit.exe`. unlike the linux builder, it does not need the stock iso/vhdx or
+a temporary win4 boot because the host windows installation can construct the
+disk, registry, and bcd directly. it emits a 64 gib vhdx, which qemu can boot
+directly. it requires an elevated windows 10/11 environment with the storage
+cmdlets, llvm's `clang-cl`/`lld-link`, the 26100 sdk/wdk files, and the
+validationos test-signing certificate chain. paths for non-default llvm, sdk,
+signtool, and certificate locations can be passed as parameters. use
+`-SkipBuild` only when the current `native\build\win0doom.exe` and signed driver
+already exist.
+
+the windows builder obtains the mounted disk number from the exact vhdx it just
+created and passes that number to every partitioning cmdlet. it never runs
+diskpart `clean` or selects a physical disk. failed partial images are preserved
+with a `.failed` suffix.
+
 ## giant warning label
 
 this is a qemu-only research prototype, not a general windows display driver.
