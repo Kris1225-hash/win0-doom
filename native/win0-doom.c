@@ -107,6 +107,23 @@ NTSYSCALLAPI NTSTATUS NTAPI NtTerminateProcess(
 );
 
 static HANDLE display_handle;
+static LONG data_prefix_index = -1;
+
+static const WCHAR *data_prefixes[] = {
+    L"\\GLOBAL??\\C:\\Windows\\System32\\",
+    L"\\Device\\HarddiskVolume1\\Windows\\System32\\",
+    L"\\Device\\HarddiskVolume2\\Windows\\System32\\",
+    L"\\Device\\HarddiskVolume3\\Windows\\System32\\",
+    L"\\Device\\HarddiskVolume4\\Windows\\System32\\",
+    L"\\Device\\HarddiskVolume5\\Windows\\System32\\",
+    L"\\Device\\HarddiskVolume6\\Windows\\System32\\",
+    L"\\Device\\HarddiskVolume7\\Windows\\System32\\",
+    L"\\Device\\HarddiskVolume8\\Windows\\System32\\",
+    L"\\Device\\HarddiskVolume9\\Windows\\System32\\",
+    L"\\Device\\HarddiskVolume10\\Windows\\System32\\",
+    L"\\Device\\HarddiskVolume11\\Windows\\System32\\",
+    L"\\Device\\HarddiskVolume12\\Windows\\System32\\"
+};
 
 static void native_print(const char *text)
 {
@@ -122,6 +139,18 @@ static void native_print(const char *text)
         RtlInitUnicodeString(&message, wide);
         NtDisplayString(&message);
     }
+}
+
+static void native_print_hex(ULONG value)
+{
+    static const char digits[] = "0123456789abcdef";
+    char text[11] = "0x00000000";
+
+    for (int index = 9; index >= 2; --index) {
+        text[index] = digits[value & 0xf];
+        value >>= 4;
+    }
+    native_print(text);
 }
 
 static void *native_malloc(int requested_size)
@@ -165,11 +194,19 @@ static BOOLEAN mode_has(const char *mode, char wanted)
     return FALSE;
 }
 
-static void ascii_path_to_native(const char *filename, WCHAR *path, ULONG capacity)
+static void ascii_path_to_native(
+    const char *filename,
+    const WCHAR *prefix,
+    WCHAR *path,
+    ULONG capacity
+)
 {
-    static const WCHAR prefix[] = L"\\SystemRoot\\System32\\";
     ULONG index = 0;
 
+    while (filename[0] == '.' &&
+           (filename[1] == '/' || filename[1] == '\\')) {
+        filename += 2;
+    }
     if (filename[0] != '\\') {
         for (ULONG prefix_index = 0;
              prefix[prefix_index] != L'\0' && index + 1 < capacity;
@@ -195,21 +232,13 @@ static void *native_open(const char *filename, const char *mode)
     ULONG disposition;
     ACCESS_MASK access;
     NTSTATUS status;
+    LONG first_prefix;
+    LONG final_prefix;
 
     file = (WIN0DOOM_FILE *)native_malloc(sizeof(*file));
     if (file == NULL) {
         return NULL;
     }
-
-    ascii_path_to_native(filename, path, ARRAYSIZE(path));
-    RtlInitUnicodeString(&name, path);
-    InitializeObjectAttributes(
-        &attributes,
-        &name,
-        OBJ_CASE_INSENSITIVE,
-        NULL,
-        NULL
-    );
 
     access = SYNCHRONIZE;
     if (mode_has(mode, 'r')) {
@@ -221,20 +250,51 @@ static void *native_open(const char *filename, const char *mode)
     disposition = mode_has(mode, 'w') ? FILE_OVERWRITE_IF :
         (mode_has(mode, 'a') ? FILE_OPEN_IF : FILE_OPEN);
 
-    status = NtCreateFile(
-        &file->Handle,
-        access,
-        &attributes,
-        &io_status,
-        NULL,
-        FILE_ATTRIBUTE_NORMAL,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        disposition,
-        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
-        NULL,
-        0
-    );
+    first_prefix = data_prefix_index >= 0 ? data_prefix_index : 0;
+    final_prefix = data_prefix_index >= 0 ? data_prefix_index + 1 :
+        (LONG)ARRAYSIZE(data_prefixes);
+    status = (NTSTATUS)0xc000003aL;
+    for (LONG prefix_index = first_prefix;
+         prefix_index < final_prefix;
+         ++prefix_index) {
+        ascii_path_to_native(
+            filename,
+            data_prefixes[prefix_index],
+            path,
+            ARRAYSIZE(path)
+        );
+        RtlInitUnicodeString(&name, path);
+        InitializeObjectAttributes(
+            &attributes,
+            &name,
+            OBJ_CASE_INSENSITIVE,
+            NULL,
+            NULL
+        );
+        status = NtCreateFile(
+            &file->Handle,
+            access,
+            &attributes,
+            &io_status,
+            NULL,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            disposition,
+            FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+            NULL,
+            0
+        );
+        if (status >= 0) {
+            data_prefix_index = prefix_index;
+            break;
+        }
+    }
     if (status < 0) {
+        native_print("\r\nwin0 doom: open failed for '");
+        native_print(filename);
+        native_print("' with status ");
+        native_print_hex((ULONG)status);
+        native_print(".\r\n");
         native_free(file);
         return NULL;
     }

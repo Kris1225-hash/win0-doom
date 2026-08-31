@@ -19,7 +19,32 @@ standard-vga aperture.
 - a native test client fills the complete 1280x800 qemu display
 - the puredoom-based executable builds as a native-subsystem pe importing only
   `ntdll.dll`
-- the first complete doom boot test and keyboard input are still in progress
+- doom finds the wad, initializes successfully, enters its demo loop, and
+  renders live game frames in validationos runlevel 0
+- keyboard input is not connected yet, so the current build is watchable but
+  not playable
+
+the successful run uses a boot-volume-discovering file layer. runlevel 0 does
+not provide the normal per-process `C:` dos-device mapping, so the platform
+layer tries `\\GLOBAL??\\C:` and the native `\\Device\\HarddiskVolume*`
+names, then caches the volume which contains the wad.
+
+## next milestone: make it playable
+
+the next change will connect qemu keyboard input without depending on win32:
+
+1. open `\\Device\\KeyboardClass1`, falling back to
+   `\\Device\\KeyboardClass0`, using `NtCreateFile`
+2. keep one asynchronous `NtReadFile` request pending and poll its event from
+   the existing game loop; this avoids adding an input thread which could race
+   puredoom's event queue
+3. translate raw set-1 make/break scan codes into puredoom key events for the
+   arrows, wasd, control, space, enter, escape, and use keys
+4. verify movement, firing, menus, and key releases in the disposable win0 vm
+
+sound remains disabled for now. it will be considered only after keyboard
+input is reliable; runlevel 0 does not provide the ordinary windows audio
+stack either.
 
 ## layout
 
@@ -80,4 +105,3 @@ certificate chain are local deployment concerns and are not stored here.
 the doom engine integration uses [PureDOOM](https://github.com/Daivuk/PureDOOM),
 which is included as a pinned git submodule and retains its own license. doom
 game data is not included.
-
