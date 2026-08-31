@@ -21,8 +21,12 @@ standard-vga aperture.
   `ntdll.dll`
 - doom finds the wad, initializes successfully, enters its demo loop, and
   renders live game frames in validationos runlevel 0
-- keyboard input is not connected yet, so the current build is watchable but
-  not playable
+- keyboard scan-code translation and the user/kernel ioctl are implemented,
+  but the in-progress kernel reader is not complete yet, so the last proven vm
+  build remains watchable rather than playable
+
+the exact state of the keyboard work, including the currently expected build
+failure and the next changes, is recorded in [`NEXT.md`](NEXT.md).
 
 the successful run uses a boot-volume-discovering file layer. runlevel 0 does
 not provide the normal per-process `C:` dos-device mapping, so the platform
@@ -33,14 +37,13 @@ names, then caches the volume which contains the wad.
 
 the next change will connect qemu keyboard input without depending on win32:
 
-1. open `\\Device\\KeyboardClass1`, falling back to
-   `\\Device\\KeyboardClass0`, using `NtCreateFile`
-2. keep one asynchronous `NtReadFile` request pending and poll its event from
-   the existing game loop; this avoids adding an input thread which could race
-   puredoom's event queue
-3. translate raw set-1 make/break scan codes into puredoom key events for the
-   arrows, wasd, control, space, enter, escape, and use keys
-4. verify movement, firing, menus, and key releases in the disposable win0 vm
+1. finish the synchronous system-thread readers for
+   `\\Device\\KeyboardClass1` and `\\Device\\KeyboardClass0`
+2. shut those threads down safely when the driver unloads
+3. build, sign, and install the driver in the disposable win0 vm while keeping
+   the known-good framebuffer-only driver and qcow2 backup intact
+4. verify escape opens doom's menu, then verify movement, firing, menus, and
+   key releases
 
 sound remains disabled for now. it will be considered only after keyboard
 input is reliable; runlevel 0 does not provide the ordinary windows audio

@@ -1,6 +1,7 @@
 #define NOMINMAX
 #include <Windows.h>
 #include <winternl.h>
+#include <ntddkbd.h>
 
 /* Tiny CRT surface required by clang's optimizer and PureDOOM. */
 int _fltused = 0;
@@ -37,6 +38,7 @@ size_t strlen(const char *text)
 #include "../PureDOOM/PureDOOM.h"
 
 #define IOCTL_WIN0DOOM_PRESENT 0x0022a000UL
+#define IOCTL_WIN0DOOM_GET_KEYBOARD 0x00222004UL
 #define FILE_STANDARD_INFORMATION_CLASS 5
 
 typedef struct _WIN0DOOM_FILE_STANDARD_INFORMATION {
@@ -107,6 +109,8 @@ NTSYSCALLAPI NTSTATUS NTAPI NtTerminateProcess(
 );
 
 static HANDLE display_handle;
+static KEYBOARD_INPUT_DATA keyboard_buffer[32];
+static BOOLEAN keyboard_available = TRUE;
 static LONG data_prefix_index = -1;
 
 static const WCHAR *data_prefixes[] = {
@@ -487,6 +491,151 @@ static NTSTATUS present_frame(void)
     );
 }
 
+static doom_key_t scan_code_to_doom(USHORT make_code, USHORT flags)
+{
+    if ((flags & KEY_E0) != 0) {
+        switch (make_code) {
+        case 0x48: return DOOM_KEY_UP_ARROW;
+        case 0x4b: return DOOM_KEY_LEFT_ARROW;
+        case 0x4d: return DOOM_KEY_RIGHT_ARROW;
+        case 0x50: return DOOM_KEY_DOWN_ARROW;
+        case 0x1d: return DOOM_KEY_CTRL;
+        case 0x38: return DOOM_KEY_ALT;
+        default: return DOOM_KEY_UNKNOWN;
+        }
+    }
+
+    switch (make_code) {
+    case 0x01: return DOOM_KEY_ESCAPE;
+    case 0x02: return DOOM_KEY_1;
+    case 0x03: return DOOM_KEY_2;
+    case 0x04: return DOOM_KEY_3;
+    case 0x05: return DOOM_KEY_4;
+    case 0x06: return DOOM_KEY_5;
+    case 0x07: return DOOM_KEY_6;
+    case 0x08: return DOOM_KEY_7;
+    case 0x09: return DOOM_KEY_8;
+    case 0x0a: return DOOM_KEY_9;
+    case 0x0b: return DOOM_KEY_0;
+    case 0x0c: return DOOM_KEY_MINUS;
+    case 0x0d: return DOOM_KEY_EQUALS;
+    case 0x0e: return DOOM_KEY_BACKSPACE;
+    case 0x0f: return DOOM_KEY_TAB;
+    case 0x10: return DOOM_KEY_Q;
+    case 0x11: return DOOM_KEY_W;
+    case 0x12: return DOOM_KEY_E;
+    case 0x13: return DOOM_KEY_R;
+    case 0x14: return DOOM_KEY_T;
+    case 0x15: return DOOM_KEY_Y;
+    case 0x16: return DOOM_KEY_U;
+    case 0x17: return DOOM_KEY_I;
+    case 0x18: return DOOM_KEY_O;
+    case 0x19: return DOOM_KEY_P;
+    case 0x1a: return DOOM_KEY_LEFT_BRACKET;
+    case 0x1b: return DOOM_KEY_RIGHT_BRACKET;
+    case 0x1c: return DOOM_KEY_ENTER;
+    case 0x1d: return DOOM_KEY_CTRL;
+    case 0x1e: return DOOM_KEY_A;
+    case 0x1f: return DOOM_KEY_S;
+    case 0x20: return DOOM_KEY_D;
+    case 0x21: return DOOM_KEY_F;
+    case 0x22: return DOOM_KEY_G;
+    case 0x23: return DOOM_KEY_H;
+    case 0x24: return DOOM_KEY_J;
+    case 0x25: return DOOM_KEY_K;
+    case 0x26: return DOOM_KEY_L;
+    case 0x27: return DOOM_KEY_SEMICOLON;
+    case 0x28: return DOOM_KEY_APOSTROPHE;
+    case 0x2a:
+    case 0x36: return DOOM_KEY_SHIFT;
+    case 0x2c: return DOOM_KEY_Z;
+    case 0x2d: return DOOM_KEY_X;
+    case 0x2e: return DOOM_KEY_C;
+    case 0x2f: return DOOM_KEY_V;
+    case 0x30: return DOOM_KEY_B;
+    case 0x31: return DOOM_KEY_N;
+    case 0x32: return DOOM_KEY_M;
+    case 0x33: return DOOM_KEY_COMMA;
+    case 0x34: return DOOM_KEY_PERIOD;
+    case 0x35: return DOOM_KEY_SLASH;
+    case 0x37: return DOOM_KEY_MULTIPLY;
+    case 0x38: return DOOM_KEY_ALT;
+    case 0x39: return DOOM_KEY_SPACE;
+    case 0x3b: return DOOM_KEY_F1;
+    case 0x3c: return DOOM_KEY_F2;
+    case 0x3d: return DOOM_KEY_F3;
+    case 0x3e: return DOOM_KEY_F4;
+    case 0x3f: return DOOM_KEY_F5;
+    case 0x40: return DOOM_KEY_F6;
+    case 0x41: return DOOM_KEY_F7;
+    case 0x42: return DOOM_KEY_F8;
+    case 0x43: return DOOM_KEY_F9;
+    default: return DOOM_KEY_UNKNOWN;
+    }
+}
+
+static void dispatch_keyboard_records(
+    const KEYBOARD_INPUT_DATA *records,
+    ULONG byte_count
+)
+{
+    ULONG record_count = byte_count / sizeof(records[0]);
+
+    for (ULONG index = 0; index < record_count; ++index) {
+        doom_key_t key = scan_code_to_doom(
+            records[index].MakeCode,
+            records[index].Flags
+        );
+        if (key == DOOM_KEY_UNKNOWN) {
+            continue;
+        }
+        if ((records[index].Flags & KEY_BREAK) != 0) {
+            doom_key_up(key);
+        } else {
+            doom_key_down(key);
+        }
+    }
+}
+
+static void poll_keyboard(void)
+{
+    IO_STATUS_BLOCK io_status;
+    NTSTATUS status;
+
+    if (!keyboard_available) {
+        return;
+    }
+    status = NtDeviceIoControlFile(
+        display_handle,
+        NULL,
+        NULL,
+        NULL,
+        &io_status,
+        IOCTL_WIN0DOOM_GET_KEYBOARD,
+        NULL,
+        0,
+        keyboard_buffer,
+        sizeof(keyboard_buffer)
+    );
+    if (status < 0) {
+        LARGE_INTEGER diagnostic_delay;
+
+        native_print("\r\nwin0 doom: keyboard ioctl failed with status ");
+        native_print_hex((ULONG)status);
+        native_print("; demo mode only.\r\n");
+        keyboard_available = FALSE;
+        diagnostic_delay.QuadPart = -50000000LL;
+        NtDelayExecution(FALSE, &diagnostic_delay);
+        return;
+    }
+    if (io_status.Information != 0) {
+        dispatch_keyboard_records(
+            keyboard_buffer,
+            (ULONG)io_status.Information
+        );
+    }
+}
+
 VOID NTAPI NtProcessStartup(PVOID StartupArgument)
 {
     char *arguments[] = {
@@ -536,6 +685,7 @@ VOID NTAPI NtProcessStartup(PVOID StartupArgument)
 
     frame_delay.QuadPart = -100000LL;
     for (;;) {
+        poll_keyboard();
         doom_update();
         status = present_frame();
         if (status < 0) {
