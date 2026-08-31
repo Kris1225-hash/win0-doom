@@ -1,0 +1,5 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Control\RunLevels]
+"0"="\\SystemRoot\\system32\\hello.exe"
+"NtInitialUserProcess"="\\SystemRoot\\system32\\hello.exe"

@@ -1,0 +1,9 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\Win0DoomDisplay]
+"DisplayName"="Win0 DOOM framebuffer bridge"
+"ErrorControl"=dword:00000001
+"Group"="Video Init"
+"ImagePath"="\\SystemRoot\\System32\\drivers\\win0doom-display.sys"
+"Start"=dword:00000000
+"Type"=dword:00000001

@@ -1,0 +1,44 @@
+# Local Microsoft SDK/WDK packages and extracted toolchains
+/toolchain/
+
+# Reference repositories used while reverse engineering
+/Validation-OS/
+/doomgeneric/
+
+# Build products
+/driver/build/
+/native/build/
+*.obj
+*.exe
+*.sys
+*.lib
+*.pdb
+*.ilk
+
+# Proprietary game data and framebuffer captures
+*.wad
+*.raw
+*.ppm
+*.png
+
+# Certificates and private-key containers
+*.cer
+*.crt
+*.pem
+*.pfx
+*.p12
+
+# VM images and runtime debris
+*.qcow2
+*.img
+*.vhd
+*.vhdx
+*.sock
+*.log
+
+# Editor and operating-system clutter
+.idea/
+.vscode/
+*~
+.DS_Store
+

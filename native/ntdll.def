@@ -1,0 +1,9 @@
+LIBRARY ntdll.dll
+EXPORTS
+    NtDisplayString
+    NtDelayExecution
+    NtTerminateProcess
+    RtlInitUnicodeString
+    memcpy
+    memmove
+    memset
