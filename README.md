@@ -34,6 +34,20 @@ not provide the normal per-process `C:` dos-device mapping, so the platform
 layer tries `\\GLOBAL??\\C:` and the native `\\Device\\HarddiskVolume*`
 names, then caches the volume which contains the wad.
 
+## demo
+
+[docs/demo-boot-to-doom.mp4](docs/demo-boot-to-doom.mp4) — one continuous
+host-side capture (wf-recorder on the qemu window region) of the full arc:
+ovmf firmware, windows boot manager, the validationos runlevel-0 banner,
+the launch command injected one scancode at a time through the qemu
+monitor, and doom rising into its attract demo. the rejected first
+attempt is left in on purpose: a monitor-fed burst of `sendkey` commands
+outran the ccs raw-input path, the command arrived garbled
+(`\SystemRoot\ssdoom.exe`), and the void answered "is not recognized".
+the slow per-key retyping that follows is the reliable method documented
+in [setup/linux.md](setup/linux.md). recorded, reviewed, and cut with
+the help of two vision models; no desktop content survives the edit.
+
 ## keyboard input
 
 runlevel 0 gives native applications no console or standard handles. directly
