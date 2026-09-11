@@ -73,6 +73,23 @@ gotchas, all hit in anger:
 - the command is `sendkey`, singular. `sendkeys <key> <key> ...` does
   not exist; the monitor answers "unknown command: 'sendkeys'" and
   nothing reaches the guest.
+- feeding every `sendkey` line in one socat burst can outrun the ccs
+  raw-input path under load: keys drop and the command arrives garbled
+  (observed live: `\SystemRoot\ssdoom.exe`, rejected as "not
+  recognized"; the identical burst typed cleanly on an idle host).
+  the reliable method sends one `sendkey` per socat invocation with
+  ~300ms between keys:
+
+  ```bash
+  for k in backslash shift-s y s t e m shift-r o o t backslash \
+           s y s t e m 3 2 backslash w i n 0 d o o m dot e x e ret; do
+    printf "sendkey $k\n" | socat -t 2 - UNIX-CONNECT:$MONITOR_SOCK > /dev/null 2>&1
+    sleep 0.3
+  done
+  ```
+
+  this slow path is what `docs/demo-boot-to-doom.mp4` shows being
+  accepted after the garbled burst was rejected.
 - key names are case-sensitive: `shift-s` works, `shift-S` does not.
 - `\` is `backslash`, `.` is `dot`, enter is `ret`.
 - the v0.1-playable image boots to a bare prompt (no `CcsCommand`
@@ -112,6 +129,35 @@ sha256sum -c release.qcow2.sha256 && cp --reflink=auto release.qcow2 run.qcow2
 # 3. screendump, convert, count colors
 # 4. 114-ish distinct colors: doom is running at runlevel 0. done.
 ```
+
+## recording a demo video
+
+`docs/demo-boot-to-doom.mp4` was captured host-side. the workflow, with
+the lessons learned baked in:
+
+- `wf-recorder -g x,y,w,h` on the exact qemu window region; geometry
+  comes from `hyprctl clients -j` (needs
+  `HYPRLAND_INSTANCE_SIGNATURE` in the environment). on wayland the
+  capture records the screen region, not the window: the recording
+  workspace must stay empty and focused for the whole take, because
+  every overlap and workspace switch lands in the footage
+- fixed duration with `timeout -s INT <secs> wf-recorder ...` —
+  SIGINT finalizes the mp4 properly; a hard-killed recorder leaves a
+  "moov atom not found" corpse
+- the distinct-color doom-init check works on raw `screendump`
+  framebuffers only. window captures include the gtk scaler, which
+  interpolates even the text console into thousands of colors, so
+  color counts cannot tell console from doom there — probe frames
+  with a vision model or eyes instead
+- review pass: downscale (`scale=944:490,fps=8,crf 32`) to fit hosted
+  vision-model video-input limits, ask for bad segments plus a
+  timestamped timeline, then probe individual frames on both sides of
+  every proposed cut before trusting it — small models confidently
+  mislabel both directions (doom gameplay as "other window", console
+  as "discord")
+- splice with `trim`/`setpts`/`concat` in one filter_complex and
+  re-encode `-crf 24 -pix_fmt yuv420p -movflags +faststart`: the
+  2:48 final came out at 13.5 mb, comfortable for git
 
 ## shutdown
 

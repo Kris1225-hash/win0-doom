@@ -55,6 +55,12 @@ the v0.1-playable release image).
   mappings that matter here: `\` = `backslash`, `.` = `dot`,
   enter = `ret`, space = `spc`, `:` = `shift-semicolon`.
 
+- inject per key with ~300ms between commands. one socat burst of all
+  `sendkey` lines can outrun the ccs raw-input path under load and the
+  command arrives garbled — `docs/demo-boot-to-doom.mp4` contains both
+  the garbled burst and the clean slow retyping. the reliable loop
+  lives in [linux.md](linux.md).
+
 - headless verification without looking at the window: count distinct
   colors in a `screendump`. the runlevel-0 text console measured 19
   distinct colors; a doom attract-demo frame measured 114. ~19 means you
