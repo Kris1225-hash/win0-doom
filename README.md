@@ -46,7 +46,6 @@ outran the ccs raw-input path, the command arrived garbled
 (`\SystemRoot\ssdoom.exe`), and the void answered "is not recognized".
 the slow per-key retyping that follows is the reliable method documented
 in [setup/linux.md](setup/linux.md). recorded, reviewed, and cut with
-
 the help of two vision models; no desktop content survives the edit.
 
 ## keyboard input
