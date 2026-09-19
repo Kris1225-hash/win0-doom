@@ -26,11 +26,11 @@ standard-vga aperture.
 - menus, key presses, key releases, movement, and firing have been proven in a
   clean runlevel-0 boot; doom is playable
 
-the exact state of the keyboard work, including the currently expected build
-failure and the next changes, is recorded in [`NEXT.md`](NEXT.md).
+the keyboard development record — failed paths, the working filter design,
+proven tests, and remaining work — is in [`NEXT.md`](NEXT.md).
 
-the successful run uses a boot-volume-discovering file layer. runlevel 0 does
-not provide the normal per-process `C:` dos-device mapping, so the platform
+the successful run uses a boot-volume-discovering file layer. runlevel 0
+does not provide the normal per-process `C:` dos-device mapping, so the platform
 layer tries `\\GLOBAL??\\C:` and the native `\\Device\\HarddiskVolume*`
 names, then caches the volume which contains the wad.
 
@@ -46,6 +46,7 @@ outran the ccs raw-input path, the command arrived garbled
 (`\SystemRoot\ssdoom.exe`), and the void answered "is not recognized".
 the slow per-key retyping that follows is the reliable method documented
 in [setup/linux.md](setup/linux.md). recorded, reviewed, and cut with
+
 the help of two vision models; no desktop content survives the edit.
 
 ## keyboard input
