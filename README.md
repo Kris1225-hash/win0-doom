@@ -29,8 +29,8 @@ standard-vga aperture.
 the keyboard development record — failed paths, the working filter design,
 proven tests, and remaining work — is in [`NEXT.md`](NEXT.md).
 
-the successful run uses a boot-volume-discovering file layer. runlevel 0
-does not provide the normal per-process `C:` dos-device mapping, so the platform
+the successful run uses a boot-volume-discovering file layer. runlevel 0 does
+not provide the normal per-process `C:` dos-device mapping, so the platform
 layer tries `\\GLOBAL??\\C:` and the native `\\Device\\HarddiskVolume*`
 names, then caches the volume which contains the wad.
 
