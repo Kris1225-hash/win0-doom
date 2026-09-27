@@ -39,6 +39,12 @@ size_t strlen(const char *text)
 
 #define IOCTL_WIN0DOOM_PRESENT 0x0022a000UL
 #define IOCTL_WIN0DOOM_GET_KEYBOARD 0x00222004UL
+#define IOCTL_WIN0DOOM_SUBMIT_AUDIO 0x0022a008UL
+#define IOCTL_WIN0DOOM_AUDIO_WANT 0x0022200cUL
+/* doom mixes 512 stereo 16-bit frames per fetch = 2048 bytes. */
+#define WIN0DOOM_AUDIO_BYTES (512 * 2 * 2)
+/* must match the driver's ring depth. */
+#define WIN0DOOM_AUDIO_BLOCKS 8UL
 #define FILE_STANDARD_INFORMATION_CLASS 5
 
 typedef struct _WIN0DOOM_FILE_STANDARD_INFORMATION {
@@ -491,6 +497,68 @@ static NTSTATUS present_frame(void)
     );
 }
 
+static BOOLEAN audio_available = TRUE;
+
+/*
+ * ask the driver how many ring blocks its hda output stream can take right now,
+ * then hand it exactly that many freshly mixed blocks. doom_get_sound_buffer()
+ * advances doom's mixer, so it must be called once per block actually consumed;
+ * pulling only what the driver has room for keeps the mixer and the 11025 hz dma
+ * drain in lock-step without dropping or fast-forwarding any audio.
+ */
+static void submit_audio(void)
+{
+    IO_STATUS_BLOCK io_status;
+    NTSTATUS status;
+    ULONG want = 0;
+
+    if (!audio_available) {
+        return;
+    }
+    status = NtDeviceIoControlFile(
+        display_handle,
+        NULL,
+        NULL,
+        NULL,
+        &io_status,
+        IOCTL_WIN0DOOM_AUDIO_WANT,
+        NULL,
+        0,
+        &want,
+        sizeof(want)
+    );
+    if (status < 0) {
+        /* an older driver without the audio ioctls: stop trying, keep playing. */
+        audio_available = FALSE;
+        return;
+    }
+    if (want > WIN0DOOM_AUDIO_BLOCKS) {
+        want = WIN0DOOM_AUDIO_BLOCKS;
+    }
+    for (ULONG index = 0; index < want; ++index) {
+        short *samples = doom_get_sound_buffer();
+        if (samples == NULL) {
+            break;
+        }
+        status = NtDeviceIoControlFile(
+            display_handle,
+            NULL,
+            NULL,
+            NULL,
+            &io_status,
+            IOCTL_WIN0DOOM_SUBMIT_AUDIO,
+            samples,
+            WIN0DOOM_AUDIO_BYTES,
+            NULL,
+            0
+        );
+        if (status < 0) {
+            audio_available = FALSE;
+            break;
+        }
+    }
+}
+
 static doom_key_t scan_code_to_doom(USHORT make_code, USHORT flags)
 {
     if ((flags & KEY_E0) != 0) {
@@ -673,13 +741,18 @@ VOID NTAPI NtProcessStartup(PVOID StartupArgument)
     doom_set_default_int("key_strafeleft", DOOM_KEY_A);
     doom_set_default_int("key_straferight", DOOM_KEY_D);
     doom_set_default_int("key_use", DOOM_KEY_E);
+    doom_set_default_int("sfx_volume", 15);
 
     native_print("\r\nwin0 doom: initializing puredoom...\r\n");
+    /*
+     * sfx now plays through the driver's hda bridge, so the sound options stay
+     * visible. music remains hidden: puredoom only emits raw midi messages
+     * (doom_tick_midi) and there is no synth on the win0 side yet.
+     */
     doom_init(
         ARRAYSIZE(arguments),
         arguments,
         DOOM_FLAG_HIDE_MOUSE_OPTIONS |
-        DOOM_FLAG_HIDE_SOUND_OPTIONS |
         DOOM_FLAG_HIDE_MUSIC_OPTIONS
     );
 
@@ -687,6 +760,7 @@ VOID NTAPI NtProcessStartup(PVOID StartupArgument)
     for (;;) {
         poll_keyboard();
         doom_update();
+        submit_audio();
         status = present_frame();
         if (status < 0) {
             native_print("\r\nwin0 doom: present failed.\r\n");

@@ -25,6 +25,9 @@ standard-vga aperture.
   records into a spinlock-protected ring while forwarding every record to ccs
 - menus, key presses, key releases, movement, and firing have been proven in a
   clean runlevel-0 boot; doom is playable
+- the driver now also drives an intel hd audio controller directly, so doom's
+  sound effects play through the same qemu (or real) hda device (**written
+  against the hda spec but not yet validated on hardware — see below**)
 
 the keyboard development record — failed paths, the working filter design,
 proven tests, and remaining work — is in [`NEXT.md`](NEXT.md).
@@ -65,15 +68,40 @@ original class callback. ccs therefore continues to receive normal input.
 opening the driver's control device discards older ring contents. this keeps
 the command used to launch `win0doom.exe` from becoming doom input.
 
-sound remains disabled. runlevel 0 does not provide the ordinary windows audio
-stack, so audio will require another native/kernel bridge if implemented.
+## sound
+
+runlevel 0 does not provide the ordinary windows audio stack, so — exactly like
+the display — the driver talks to the audio hardware itself. it scans pci bus 0
+for an intel hd audio controller (qemu's `ich9-intel-hda`, or a real one), maps
+its mmio bar, resets the controller, brings up corb/rirb, walks the codec to
+find an output converter and an output-capable pin, and starts one output stream
+looping over a small cyclic dma ring at doom's native 11025 hz / 16-bit / stereo
+format.
+
+each frame the game hands the driver its freshly mixed 2048-byte sfx block
+through `IOCTL_WIN0DOOM_SUBMIT_AUDIO`; the driver writes it one block ahead of
+the hardware read position and drops a block when the ring is full, which paces
+the game loop to the dma drain rate. the whole bring-up is best-effort: if no
+controller is found or any step fails, audio stays silent and doom runs exactly
+as before — it never blocks the frame loop or bugchecks.
+
+only sound effects are wired up. puredoom emits music as raw midi messages
+(`doom_tick_midi`) with no synth, so music needs a softsynth on the win0 side
+and is left for later.
+
+> **status: not yet hardware-validated.** the hda path was written from the
+> intel hda 1.0a spec and the engine-side pipeline (wad load, live frames, and
+> real pcm out of `doom_get_sound_buffer`) was proven with a headless puredoom
+> harness, but the kernel audio bring-up could not be booted in this
+> environment. it wants a real (disposable) runlevel-0 boot on the documented
+> qemu setup, which already includes `-device ich9-intel-hda`.
 
 ## layout
 
 - `native/win0-doom.c` — puredoom platform layer using native nt apis
 - `native/build-win0-doom.sh` — clang/lld native executable build
-- `driver/win0doom-display.c` — qemu stdvga framebuffer bridge and keyboard
-  class upper filter
+- `driver/win0doom-display.c` — qemu stdvga framebuffer bridge, intel hd audio
+  output bridge, and keyboard class upper filter
 - `driver/build-driver.sh` — wdk kernel-driver build
 - `driver/install-win0doom-display.reg` — boot-start service definition
 - `native/driver-display-test.c` — full-screen gradient test client
