@@ -287,11 +287,6 @@ static void Win0DoomHdaWrite16(ULONG offset, USHORT value)
     *(volatile USHORT *)(g_Audio.Bar + offset) = value;
 }
 
-static UCHAR Win0DoomHdaRead8(ULONG offset)
-{
-    return *(volatile UCHAR *)(g_Audio.Bar + offset);
-}
-
 static void Win0DoomHdaWrite8(ULONG offset, UCHAR value)
 {
     *(volatile UCHAR *)(g_Audio.Bar + offset) = value;
@@ -302,13 +297,26 @@ static void Win0DoomStall(ULONG microseconds)
     KeStallExecutionProcessor(microseconds);
 }
 
-/* legacy pci configuration space access (mechanism #1) for bus 0 devices. */
+/* pci configuration space access on bus 0 via the hal (no port intrinsics). */
 static ULONG Win0DoomPciConfigRead(ULONG device, ULONG function, ULONG offset)
 {
-    ULONG address = 0x80000000UL |
-        (device << 11) | (function << 8) | (offset & 0xfc);
-    WRITE_PORT_ULONG((PULONG)(ULONG_PTR)0xcf8, address);
-    return READ_PORT_ULONG((PULONG)(ULONG_PTR)0xcfc);
+    PCI_SLOT_NUMBER slot;
+    ULONG value = 0xffffffffUL;
+
+    slot.u.AsULONG = 0;
+    slot.u.bits.DeviceNumber = device;
+    slot.u.bits.FunctionNumber = function;
+    if (HalGetBusDataByOffset(
+            PCIConfiguration,
+            0,
+            slot.u.AsULONG,
+            &value,
+            offset,
+            sizeof(value)
+        ) != sizeof(value)) {
+        return 0xffffffffUL;
+    }
+    return value;
 }
 
 static void Win0DoomPciConfigWrite(
@@ -318,10 +326,19 @@ static void Win0DoomPciConfigWrite(
     ULONG value
 )
 {
-    ULONG address = 0x80000000UL |
-        (device << 11) | (function << 8) | (offset & 0xfc);
-    WRITE_PORT_ULONG((PULONG)(ULONG_PTR)0xcf8, address);
-    WRITE_PORT_ULONG((PULONG)(ULONG_PTR)0xcfc, value);
+    PCI_SLOT_NUMBER slot;
+
+    slot.u.AsULONG = 0;
+    slot.u.bits.DeviceNumber = device;
+    slot.u.bits.FunctionNumber = function;
+    HalSetBusDataByOffset(
+        PCIConfiguration,
+        0,
+        slot.u.AsULONG,
+        &value,
+        offset,
+        sizeof(value)
+    );
 }
 
 /* locate an hda controller on pci bus 0; return its mmio base, or 0. */
