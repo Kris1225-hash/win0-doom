@@ -287,6 +287,11 @@ static void Win0DoomHdaWrite16(ULONG offset, USHORT value)
     *(volatile USHORT *)(g_Audio.Bar + offset) = value;
 }
 
+static UCHAR Win0DoomHdaRead8(ULONG offset)
+{
+    return *(volatile UCHAR *)(g_Audio.Bar + offset);
+}
+
 static void Win0DoomHdaWrite8(ULONG offset, UCHAR value)
 {
     *(volatile UCHAR *)(g_Audio.Bar + offset) = value;
@@ -578,6 +583,58 @@ static void Win0DoomHdaStartStream(void)
     );
 }
 
+/*
+ * stop every dma engine that may reference the dma block - the output stream,
+ * corb, and rirb - wait for each to report idle, then hold the controller in
+ * reset. only after that may the block be freed.
+ */
+static void Win0DoomHdaQuiesce(void)
+{
+    if (g_Audio.Bar == NULL) {
+        return;
+    }
+    if (g_Audio.StreamBase != 0) {
+        Win0DoomHdaWrite32(g_Audio.StreamBase + HDA_SD_CTL, 0);
+        for (ULONG attempt = 0; attempt < 1000; ++attempt) {
+            if ((Win0DoomHdaRead32(g_Audio.StreamBase + HDA_SD_CTL) &
+                 HDA_SDCTL_RUN) == 0) {
+                break;
+            }
+            Win0DoomStall(10);
+        }
+    }
+    Win0DoomHdaWrite8(HDA_REG_CORBCTL, 0);
+    Win0DoomHdaWrite8(HDA_REG_RIRBCTL, 0);
+    for (ULONG attempt = 0; attempt < 1000; ++attempt) {
+        if ((Win0DoomHdaRead8(HDA_REG_CORBCTL) & HDA_CORBCTL_RUN) == 0 &&
+            (Win0DoomHdaRead8(HDA_REG_RIRBCTL) & HDA_RIRBCTL_RUN) == 0) {
+            break;
+        }
+        Win0DoomStall(10);
+    }
+    Win0DoomHdaWrite32(HDA_REG_GCTL, 0);
+    for (ULONG attempt = 0; attempt < 1000; ++attempt) {
+        if ((Win0DoomHdaRead32(HDA_REG_GCTL) & HDA_GCTL_CRST) == 0) {
+            break;
+        }
+        Win0DoomStall(10);
+    }
+}
+
+/* quiesce the controller, then release the dma block and the bar mapping. */
+static void Win0DoomHdaRelease(void)
+{
+    Win0DoomHdaQuiesce();
+    if (g_Audio.Dma != NULL) {
+        MmFreeContiguousMemory(g_Audio.Dma);
+        g_Audio.Dma = NULL;
+    }
+    if (g_Audio.Bar != NULL) {
+        MmUnmapIoSpace((PVOID)g_Audio.Bar, 0x4000);
+        g_Audio.Bar = NULL;
+    }
+}
+
 /* one-time best-effort audio bring-up; failure just leaves doom silent. */
 static void Win0DoomHdaInitialize(void)
 {
@@ -674,29 +731,12 @@ static void Win0DoomHdaInitialize(void)
     return;
 
 fail:
-    if (g_Audio.Dma != NULL) {
-        MmFreeContiguousMemory(g_Audio.Dma);
-        g_Audio.Dma = NULL;
-    }
-    if (g_Audio.Bar != NULL) {
-        MmUnmapIoSpace((PVOID)g_Audio.Bar, 0x4000);
-        g_Audio.Bar = NULL;
-    }
+    Win0DoomHdaRelease();
 }
 
 static void Win0DoomHdaTeardown(void)
 {
-    if (g_Audio.Bar != NULL && g_Audio.StreamBase != 0) {
-        Win0DoomHdaWrite32(g_Audio.StreamBase + HDA_SD_CTL, 0);
-    }
-    if (g_Audio.Dma != NULL) {
-        MmFreeContiguousMemory(g_Audio.Dma);
-        g_Audio.Dma = NULL;
-    }
-    if (g_Audio.Bar != NULL) {
-        MmUnmapIoSpace((PVOID)g_Audio.Bar, 0x4000);
-        g_Audio.Bar = NULL;
-    }
+    Win0DoomHdaRelease();
     g_Audio.Enabled = FALSE;
 }
 
