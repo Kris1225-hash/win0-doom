@@ -208,3 +208,42 @@ certificate chain are local deployment concerns and are not stored here.
 the doom engine integration uses [PureDOOM](https://github.com/Daivuk/PureDOOM),
 which is included as a pinned git submodule and retains its own license. doom
 game data is not included.
+
+## license
+
+the project's own code — the native platform layer, the kernel driver,
+the probes, and the setup and build tooling — is released under the
+[mit license](LICENSE).
+
+`PureDOOM/` is a pinned submodule of
+[daivuk/puredoom](https://github.com/Daivuk/PureDOOM), which is licensed
+under the gnu gpl, version 2. `win0doom.exe` links puredoom, so built
+copies of the executable are gpl-2.0 works and must be distributed under
+those terms. `win0doom-display.sys` contains no doom code and is plain mit.
+
+doom game data is not covered by either license and is not included.
+bring your own legally obtained wad.
+
+## what the keyboard filter does (and doesn't)
+
+a boot-start driver sitting in the keyboard stack looks a lot like a
+keylogger, so here is exactly what it does with your keys.
+
+- it copies each `KEYBOARD_INPUT_DATA` record into a 128-entry ring in
+  nonpaged memory, then immediately hands the same record to the original
+  kbdclass callback. ccs still receives every key, unchanged and undelayed.
+- the ring is the only copy. when it fills, the oldest record is
+  overwritten. nothing is written to disk, the registry, or the network,
+  and the driver has no code that could.
+- the only reader is `win0doom.exe`, through `IOCTL_WIN0DOOM_GET_KEYBOARD`
+  on the driver's control device. opening that device discards anything
+  already in the ring, so the command you typed to launch doom never
+  becomes doom input.
+- uninstalling the driver removes the filter. without it, the keyboard
+  stack is stock.
+- if you don't trust me go check the code: [`driver/win0doom-display.c`](driver/win0doom-display.c)
+- runlevel 0 starts no services, so there's no network to send anything over even if the driver wanted to. your keys have nowhere to go but doom.
+
+it exists because runlevel 0 gives native programs no console and no
+user-mode route to the keyboard. this is the smallest thing that lets
+doom see wasd.
