@@ -67,9 +67,36 @@ bugcheck.
 - a second driver backup preserves the first working filter before the
   launch-input ring reset
 
+## audio
+
+sound effects are now bridged through an intel hd audio controller. the driver
+scans pci bus 0 for the hda class code, maps bar0, resets the controller, brings
+up corb/rirb, enumerates the codec for an output dac + output pin, and runs one
+output stream over a cyclic dma ring at 11025 hz / 16-bit / stereo. the native
+loop pushes doom's per-frame `doom_get_sound_buffer()` block down
+`IOCTL_WIN0DOOM_SUBMIT_AUDIO`, and the driver keeps the ring one block ahead of
+the hardware read pointer (dropping blocks when full) to pace itself to the dma
+drain rate. every step is best-effort: any failure leaves doom running silently.
+
+what was proven vs. what still needs a real boot:
+
+- proven off-target: a headless puredoom harness confirmed the wad loads, live
+  frames render, and `doom_get_sound_buffer()` returns real non-zero pcm during
+  the attract demo — i.e. the exact data the driver now consumes
+- not yet proven: the kernel hda bring-up itself. it was written from the intel
+  hda 1.0a spec but never booted, because this environment has no way to build
+  the wdk driver or run the runlevel-0 vm. it needs a disposable runlevel-0 boot
+  on the documented qemu setup (which already passes `-device ich9-intel-hda`)
+- likely first things to check on hardware if silent: whether the codec routes
+  dac -> pin directly (a mixer/selector widget in between would need its own amp
+  unmute + connection select), the discovered output-stream descriptor index,
+  and that bus mastering actually took in the pci command register
+
 ## remaining work
 
-- add audio only if a small native/kernel bridge is worth the complexity
+- validate the hda audio path on real runlevel-0 hardware; handle codecs whose
+  dac reaches the pin through an intermediate mixer/selector widget
+- add doom music: puredoom only emits raw midi, so this needs a small softsynth
 - replace the hard-coded stdvga physical aperture with discovered resources
 - package test signing and deployment into a reproducible disposable-vm flow
 - test device removal and driver-unload paths beyond the normal boot-only use
