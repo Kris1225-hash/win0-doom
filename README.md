@@ -227,17 +227,13 @@ keep a verified disk backup, and do not install this on real hardware.
 the driver is intentionally unsigned in source form. test signing and the test
 certificate chain are local deployment concerns and are not stored here.
 
-## third-party software
-
-the doom engine integration uses [PureDOOM](https://github.com/Daivuk/PureDOOM),
-which is included as a pinned git submodule and retains its own license. doom
-game data is not included.
-
 ## license
 
 the project's own code — the native platform layer, the kernel driver,
 the probes, and the setup and build tooling — is released under the
 [mit license](LICENSE).
+
+### puredoom and game data
 
 `PureDOOM/` is a pinned submodule of
 [daivuk/puredoom](https://github.com/Daivuk/PureDOOM), which is licensed
