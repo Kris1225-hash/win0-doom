@@ -3,6 +3,23 @@
 #include <winternl.h>
 #include <ntddkbd.h>
 
+/* winternl.h does not export this one; it is the "old driver" answer to
+ * an ioctl the device does not implement. */
+#ifndef STATUS_INVALID_DEVICE_REQUEST
+#define STATUS_INVALID_DEVICE_REQUEST ((NTSTATUS)0xc0000010L)
+#endif
+
+#include "driver/win0doom-audio.h"
+
+/*
+ * The PCM ABI is only valid if PureDOOM still mixes 512 stereo S16LE frames
+ * per doom_get_sound_buffer() call. Fail the build if that ever drifts.
+ */
+typedef char win0doom_audio_block_bytes_check[
+    (WIN0DOOM_PCM_BLOCK_FRAMES * WIN0DOOM_PCM_CHANNELS *
+     (WIN0DOOM_PCM_BITS_PER_SAMPLE / 8) == WIN0DOOM_PCM_BLOCK_BYTES) ? 1 : -1
+];
+
 /* Tiny CRT surface required by clang's optimizer and PureDOOM. */
 int _fltused = 0;
 
@@ -112,6 +129,19 @@ static HANDLE display_handle;
 static KEYBOARD_INPUT_DATA keyboard_buffer[32];
 static BOOLEAN keyboard_available = TRUE;
 static LONG data_prefix_index = -1;
+
+/*
+ * One doom_get_sound_buffer() block is 512 frames at 11025 Hz, i.e.
+ * 512 / 11025 s = 464399.09 100-ns ticks. Truncating to 464399 under-runs
+ * playback by 0.09 ticks per block (about 0.2 ppm), far below any audible
+ * or measurable drift over a demo run.
+ */
+#define WIN0DOOM_AUDIO_BLOCK_TICKS 464399LL
+#define WIN0DOOM_AUDIO_MAX_ERRORS 8UL
+#define WIN0DOOM_AUDIO_MAX_CATCHUP 3UL
+
+static BOOLEAN audio_available = TRUE;
+static ULONG audio_error_count;
 
 static const WCHAR *data_prefixes[] = {
     L"\\GLOBAL??\\C:\\Windows\\System32\\",
@@ -225,7 +255,7 @@ static void ascii_path_to_native(
     path[index] = L'\0';
 }
 
-static void *native_open(const char *filename, const char *mode)
+static void *native_open_impl(const char *filename, const char *mode, BOOLEAN quiet)
 {
     WCHAR path[320];
     UNICODE_STRING name;
@@ -294,11 +324,13 @@ static void *native_open(const char *filename, const char *mode)
         }
     }
     if (status < 0) {
-        native_print("\r\nwin0 doom: open failed for '");
-        native_print(filename);
-        native_print("' with status ");
-        native_print_hex((ULONG)status);
-        native_print(".\r\n");
+        if (!quiet) {
+            native_print("\r\nwin0 doom: open failed for '");
+            native_print(filename);
+            native_print("' with status ");
+            native_print_hex((ULONG)status);
+            native_print(".\r\n");
+        }
         native_free(file);
         return NULL;
     }
@@ -319,6 +351,11 @@ static void *native_open(const char *filename, const char *mode)
         file->Position = file->Length;
     }
     return file;
+}
+
+static void *native_open(const char *filename, const char *mode)
+{
+    return native_open_impl(filename, mode, FALSE);
 }
 
 static void native_close(void *handle)
@@ -491,6 +528,246 @@ static NTSTATUS present_frame(void)
     );
 }
 
+#define WIN0DOOM_SELFTEST_TONE_HZ 440UL
+#define WIN0DOOM_SELFTEST_TONE_FRAMES WIN0DOOM_PCM_SAMPLE_RATE
+#define WIN0DOOM_SELFTEST_SILENCE_FRAMES (WIN0DOOM_PCM_SAMPLE_RATE / 4UL)
+#define WIN0DOOM_SELFTEST_PHASE_STEP \
+    ((ULONG)(((unsigned long long)WIN0DOOM_SELFTEST_TONE_HZ << 32) / \
+             WIN0DOOM_PCM_SAMPLE_RATE))
+
+/*
+ * One period of sin() sampled 64 times, scaled to 32767. Playback phase is a
+ * 32-bit accumulator: one full wrap is one period, so the tone frequency is
+ * the phase step, independent of the interpolation error.
+ */
+static const short selftest_sine[65] = {
+    0, 3212, 6393, 9512, 12539, 15446, 18204, 20787,
+    23170, 25329, 27245, 28898, 30273, 31356, 32137, 32609,
+    32767, 32609, 32137, 31356, 30273, 28898, 27245, 25329,
+    23170, 20787, 18204, 15446, 12539, 9512, 6393, 3212,
+    0, -3212, -6393, -9512, -12539, -15446, -18204, -20787,
+    -23170, -25329, -27245, -28898, -30273, -31356, -32137, -32609,
+    -32767, -32609, -32137, -31356, -30273, -28898, -27245, -25329,
+    -23170, -20787, -18204, -15446, -12539, -9512, -6393, -3212,
+    0
+};
+
+static void audio_fill_tone(short *frames, ULONG frame_count, ULONG *phase)
+{
+    for (ULONG index = 0; index < frame_count; ++index) {
+        ULONG table_index = *phase >> 26;
+        ULONG fraction = (*phase >> 10) & 0xffffUL;
+        long difference = (long)selftest_sine[table_index + 1] -
+            (long)selftest_sine[table_index];
+        long sample = (long)selftest_sine[table_index] +
+            ((difference * (long)fraction) >> 16);
+
+        sample >>= 1; /* half scale keeps headroom for the demo mix */
+        frames[index * WIN0DOOM_PCM_CHANNELS] = (short)sample;
+        frames[index * WIN0DOOM_PCM_CHANNELS + 1] = (short)sample;
+        *phase += WIN0DOOM_SELFTEST_PHASE_STEP;
+    }
+}
+
+static NTSTATUS audio_write(const void *block, ULONG length)
+{
+    IO_STATUS_BLOCK io_status;
+
+    return NtDeviceIoControlFile(
+        display_handle,
+        NULL,
+        NULL,
+        NULL,
+        &io_status,
+        WIN0DOOM_IOCTL_SOUND_WRITE,
+        (PVOID)block,
+        length,
+        NULL,
+        0
+    );
+}
+
+/*
+ * Temporary capture diagnostic: when "win0-audio-dump" exists in System32,
+ * tee every submitted block to win0doom-client.pcm so the exact PCM the
+ * client produced can be compared with what qemu's wav audiodev recorded.
+ */
+#define WIN0DOOM_AUDIO_DUMP_LIMIT (4UL * 1024UL * 1024UL)
+static void *audio_dump_handle;
+static ULONG audio_dump_bytes;
+
+static void audio_dump_start(void)
+{
+    void *marker = native_open_impl("win0-audio-dump", "r", TRUE);
+
+    if (marker == NULL) {
+        return;
+    }
+    native_close(marker);
+    audio_dump_handle = native_open_impl("win0doom-client.pcm", "w", TRUE);
+}
+
+static BOOLEAN audio_write_block(const void *block, ULONG length)
+{
+    NTSTATUS status;
+
+    if (audio_dump_handle != NULL && audio_dump_bytes < WIN0DOOM_AUDIO_DUMP_LIMIT) {
+        native_write(audio_dump_handle, block, (int)length);
+        audio_dump_bytes += length;
+    }
+    status = audio_write(block, length);
+
+    if (status >= 0) {
+        audio_error_count = 0;
+        return TRUE;
+    }
+    if (status == STATUS_INVALID_DEVICE_REQUEST) {
+        /* Driver predates the PCM ABI: disable silently and never retry. */
+        audio_available = FALSE;
+        return FALSE;
+    }
+    ++audio_error_count;
+    if (audio_error_count >= WIN0DOOM_AUDIO_MAX_ERRORS) {
+        audio_available = FALSE;
+        native_print("\r\nwin0 doom: audio ioctl failed repeatedly with status ");
+        native_print_hex((ULONG)status);
+        native_print("; audio disabled.\r\n");
+    }
+    return FALSE;
+}
+
+static void audio_report_status(void)
+{
+    IO_STATUS_BLOCK io_status;
+    WIN0DOOM_AUDIO_STATUS audio_status;
+    NTSTATUS status;
+
+    memset(&audio_status, 0, sizeof(audio_status));
+    status = NtDeviceIoControlFile(
+        display_handle,
+        NULL,
+        NULL,
+        NULL,
+        &io_status,
+        WIN0DOOM_IOCTL_SOUND_STATUS,
+        NULL,
+        0,
+        &audio_status,
+        sizeof(audio_status)
+    );
+    if (status < 0) {
+        return;
+    }
+    native_print("\r\nwin0 doom: audio sample rate ");
+    native_print_hex(audio_status.SampleRate);
+    native_print(" device ready ");
+    native_print_hex(audio_status.DeviceReady);
+    native_print(" device status ");
+    native_print_hex(audio_status.DeviceStatus);
+    native_print(".\r\n");
+}
+
+static BOOLEAN audio_selftest_requested(void)
+{
+    void *marker = native_open_impl("win0-audio-selftest", "r", TRUE);
+
+    if (marker == NULL) {
+        return FALSE;
+    }
+    native_close(marker);
+    return TRUE;
+}
+
+/*
+ * Submit 1.0 s of 440 Hz stereo sine followed by 0.25 s of silence, paced at
+ * the PCM block cadence so the driver ring sees exactly one block per period.
+ * Gives the host harness a deterministic spectral peak before the demo starts.
+ */
+static void audio_selftest(void)
+{
+    static short block[WIN0DOOM_PCM_BLOCK_BYTES / sizeof(short)];
+    const ULONG block_frames =
+        WIN0DOOM_PCM_BLOCK_BYTES / (WIN0DOOM_PCM_CHANNELS * sizeof(short));
+    const ULONG total_frames =
+        WIN0DOOM_SELFTEST_TONE_FRAMES + WIN0DOOM_SELFTEST_SILENCE_FRAMES;
+    ULONG written_frames = 0;
+    ULONG phase = 0;
+
+    while (written_frames < total_frames) {
+        ULONG frames = total_frames - written_frames;
+        ULONG tone_frames = 0;
+
+        if (frames > block_frames) {
+            frames = block_frames;
+        }
+        if (written_frames < WIN0DOOM_SELFTEST_TONE_FRAMES) {
+            tone_frames = WIN0DOOM_SELFTEST_TONE_FRAMES - written_frames;
+            if (tone_frames > frames) {
+                tone_frames = frames;
+            }
+        }
+        if (tone_frames != 0) {
+            audio_fill_tone(block, tone_frames, &phase);
+        }
+        if (tone_frames < frames) {
+            memset(
+                block + tone_frames * WIN0DOOM_PCM_CHANNELS,
+                0,
+                (frames - tone_frames) * WIN0DOOM_PCM_CHANNELS * sizeof(short)
+            );
+        }
+        if (!audio_write_block(
+                block,
+                frames * WIN0DOOM_PCM_CHANNELS * sizeof(short))) {
+            return;
+        }
+        written_frames += frames;
+        if (written_frames < total_frames) {
+            LARGE_INTEGER block_delay;
+
+            block_delay.QuadPart = -WIN0DOOM_AUDIO_BLOCK_TICKS;
+            NtDelayExecution(FALSE, &block_delay);
+        }
+    }
+    native_print("\r\nwin0 doom: audio selftest submitted\r\n");
+}
+
+static void audio_service(LONGLONG *deadline)
+{
+    LARGE_INTEGER now;
+    ULONG blocks = 0;
+
+    if (!audio_available) {
+        return;
+    }
+    NtQuerySystemTime(&now);
+    /*
+     * I_UpdateSound() advances channel positions on every call, so the
+     * deadline is never moved without a matching mix: skipping a block would
+     * desynchronise sound effects rather than just drop audio. The game loop
+     * can take ~30 ms per iteration, so one block (46.44 ms) of lateness is
+     * normal and is paid back with an extra block here.
+     */
+    while (now.QuadPart >= *deadline &&
+           blocks < WIN0DOOM_AUDIO_MAX_CATCHUP) {
+        audio_write_block(doom_get_sound_buffer(), WIN0DOOM_PCM_BLOCK_BYTES);
+        *deadline += WIN0DOOM_AUDIO_BLOCK_TICKS;
+        ++blocks;
+        if (!audio_available) {
+            return;
+        }
+    }
+    if (now.QuadPart >= *deadline) {
+        /*
+         * Still more than WIN0DOOM_AUDIO_MAX_CATCHUP blocks behind: drop the
+         * rest of the backlog instead of bursting. Resynchronise to the
+         * current time (not now + one block) so the next iteration resumes
+         * mixing immediately and does not discard an extra period of audio.
+         */
+        *deadline = now.QuadPart;
+    }
+}
+
 static doom_key_t scan_code_to_doom(USHORT make_code, USHORT flags)
 {
     if ((flags & KEY_E0) != 0) {
@@ -644,6 +921,8 @@ VOID NTAPI NtProcessStartup(PVOID StartupArgument)
         "doom1.wad"
     };
     LARGE_INTEGER frame_delay;
+    LARGE_INTEGER audio_time;
+    LONGLONG audio_deadline;
     NTSTATUS status;
 
     UNREFERENCED_PARAMETER(StartupArgument);
@@ -652,6 +931,12 @@ VOID NTAPI NtProcessStartup(PVOID StartupArgument)
     if (status < 0) {
         native_print("\r\nwin0 doom: display driver is unavailable.\r\n");
         native_exit((int)status);
+    }
+
+    audio_dump_start();
+    audio_report_status();
+    if (audio_selftest_requested()) {
+        audio_selftest();
     }
 
     doom_set_print(native_print);
@@ -673,6 +958,9 @@ VOID NTAPI NtProcessStartup(PVOID StartupArgument)
     doom_set_default_int("key_strafeleft", DOOM_KEY_A);
     doom_set_default_int("key_straferight", DOOM_KEY_D);
     doom_set_default_int("key_use", DOOM_KEY_E);
+    /* PureDOOM's default sfx volume is 8/15; full scale makes the selftest
+     * tone and the demo's gunfire unambiguous in the host WAV capture. */
+    doom_set_default_int("sfx_volume", 15);
 
     native_print("\r\nwin0 doom: initializing puredoom...\r\n");
     doom_init(
@@ -683,9 +971,12 @@ VOID NTAPI NtProcessStartup(PVOID StartupArgument)
         DOOM_FLAG_HIDE_MUSIC_OPTIONS
     );
 
+    NtQuerySystemTime(&audio_time);
+    audio_deadline = audio_time.QuadPart + WIN0DOOM_AUDIO_BLOCK_TICKS;
     frame_delay.QuadPart = -100000LL;
     for (;;) {
         poll_keyboard();
+        audio_service(&audio_deadline);
         doom_update();
         status = present_frame();
         if (status < 0) {

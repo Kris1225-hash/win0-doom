@@ -25,9 +25,16 @@ standard-vga aperture.
   records into a spinlock-protected ring while forwarding every record to ccs
 - menus, key presses, key releases, movement, and firing have been proven in a
   clean runlevel-0 boot; doom is playable
+- the game's PCM output is audible: the native client drains PureDOOM's
+  11025 Hz stereo mixer into the driver, which programs qemu's emulated Sound
+  Blaster 16 and its ISA DMA channel. a host-side `-audiodev wav` capture of a
+  run contains the deterministic 440 Hz startup self-test and the attract
+  demo's sound effects, and its per-second levels match a reference dump of
+  the same mixer output. music is not implemented: PureDOOM only emits MIDI
+  events and there is no synth in runlevel 0
 
-the keyboard development record — failed paths, the working filter design,
-proven tests, and remaining work — is in [`NEXT.md`](NEXT.md).
+the keyboard and audio development records — failed paths, the working
+designs, measurements, and remaining work — are in [`NEXT.md`](NEXT.md).
 
 the successful run uses a boot-volume-discovering file layer. runlevel 0 does
 not provide the normal per-process `C:` dos-device mapping, so the platform
@@ -65,20 +72,70 @@ original class callback. ccs therefore continues to receive normal input.
 opening the driver's control device discards older ring contents. this keeps
 the command used to launch `win0doom.exe` from becoming doom input.
 
-sound remains disabled. runlevel 0 does not provide the ordinary windows audio
-stack, so audio will require another native/kernel bridge if implemented.
+## audio
+
+runlevel 0 has no audio stack at all: no port class, no audio service, no
+`winmm`/WASAPI. the solution is the same shape as the display and keyboard
+paths — the game submits PCM to the driver, and the driver owns the hardware.
+
+- PureDOOM's mixer is pull-based. `doom_get_sound_buffer()` returns one block
+  of 512 interleaved stereo frames (2048 bytes, signed 16-bit, 11025 Hz) and
+  advances the active sound channels. the client calls it every 46.44 ms and
+  submits the block with `IOCTL_WIN0DOOM_SOUND_WRITE`.
+- `driver/win0doom-audio.c` keeps a 64 KiB drop-oldest ring and a 32 KiB
+  physically contiguous DMA buffer. a PASSIVE pump thread resets and
+  configures the emulated SB16 (16-bit stereo, auto-init, DSP 4.5), programs
+  8237 channel 5 and refills the buffer half a block behind the play cursor.
+  the cursor is read from the DMA controller itself, not estimated from wall
+  time; a time-based estimate drifted by a non-4-byte amount and rotated the
+  16-bit sample stream, which turns quiet audio into full-scale noise.
+- no interrupt handler is installed. the 16-bit DMA interrupt is acknowledged
+  by reading the DSP's `0x22f` port from the pump, which keeps the emulated
+  ISA line low; polling the DMA count is enough for playback.
+- diagnostics: the driver appends DSP reset/version, DMA address and
+  per-second ring counters to `\SystemRoot\win0doom-audio.log`. creating
+  `C:\Windows\System32\win0-audio-selftest` makes the client submit a 1 s
+  440 Hz tone (plus 0.25 s silence) before doom starts; creating
+  `win0-audio-dump` additionally tees the exact submitted PCM to
+  `win0doom-client.pcm` for comparison.
+
+to capture what the VM plays, launch qemu with a wav audiodev and the SB16:
+
+```bash
+-device sb16,audiodev=snd0 \
+-audiodev wav,id=snd0,path=capture.wav
+```
+
+`tools/audio-capture.sh` does this headlessly (OVMF, `-vga std`, monitor
+socket, screendumps, the slow `sendkey` scenario, clean HMP `quit`) and
+`tools/audio-report.py` turns the capture into a verdict, waveform and
+spectrogram PNGs, a JSON report, and one-second WAV slices. note that qemu
+leaves the RIFF/data sizes zeroed in the file; the analyzer derives the length
+from the file size and rewrites correct headers for the slices.
+
+the analyzer needs python3 with numpy and Pillow on the host. sound effects
+only: PureDOOM produces no music PCM, and `doom_tick_midi()` is a 140 Hz MIDI
+event pump that would need an OPL/FM synth the image does not have.
 
 ## layout
 
 - `native/win0-doom.c` — puredoom platform layer using native nt apis
 - `native/build-win0-doom.sh` — clang/lld native executable build
-- `driver/win0doom-display.c` — qemu stdvga framebuffer bridge and keyboard
-  class upper filter
+- `driver/win0doom-display.c` — qemu stdvga framebuffer bridge (PCI-discovered
+  aperture and VBE geometry), keyboard class upper filter, and the control
+  device that dispatches the display/keyboard/audio ioctls
+- `driver/win0doom-audio.c` — SB16/ISA-DMA PCM sink, ring buffer, pump thread
+  and the `\SystemRoot\win0doom-audio.log` diagnostics
+- `driver/win0doom-audio.h` — shared native/driver PCM ABI
 - `driver/build-driver.sh` — wdk kernel-driver build
 - `driver/install-win0doom-display.reg` — boot-start service definition
 - `native/driver-display-test.c` — full-screen gradient test client
 - `native/input-probe.c` — confirms win0 native processes have no usable
   standard handles
+- `tools/audio-capture.sh` / `tools/audio-report.py` — headless playback
+  capture and waveform/spectrogram analysis
+- `tools/disposable-vm.sh` — build, sign, verify, copy a base image, deploy
+  the payload and optionally run the evidence harness
 - `PureDOOM/` — pinned upstream puredoom submodule
 
 the other native programs are small probes which established what runlevel 0
@@ -194,11 +251,20 @@ with a `.failed` suffix.
 
 ## giant warning label
 
-this is a qemu-only research prototype, not a general windows display driver.
-the current driver assumes a 1280x800, 32-bpp qemu stdvga framebuffer at
-physical address `0x80000000`. mapping the wrong physical address from kernel
-mode is an excellent way to crash or corrupt a machine. use a disposable vm,
-keep a verified disk backup, and do not install this on real hardware.
+this is a qemu-only research prototype, not a general windows display or audio
+driver. the driver scans PCI configuration space for qemu's stdvga
+(`1234:1111`), enables memory decode, maps the firmware-assigned 16 MiB BAR0
+instead of assuming `0x80000000`, and reads the VBE DISPI registers for the
+visible geometry (falling back to the verified 1280x800x32 layout). the
+framebuffer still has to be qemu stdvga. mapping the wrong physical address
+from kernel mode is an excellent way to crash or corrupt a machine. use a
+disposable vm, keep a verified disk backup, and do not install this on real
+hardware.
+
+the audio sink assumes qemu's emulated Sound Blaster 16 at `0x220` and 8237
+DMA channel 5. it writes the DSP and DMA controller ports directly and has no
+interrupt handler; the 16-bit interrupt is acknowledged by polling. do not
+point this at a machine whose DMA channel or ports are owned by something else.
 
 the driver is intentionally unsigned in source form. test signing and the test
 certificate chain are local deployment concerns and are not stored here.

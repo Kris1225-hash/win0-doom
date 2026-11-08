@@ -84,5 +84,14 @@ cp -p -- "$doom" "$mount_root/Windows/System32/win0doom.exe"
 if [[ -n "$wad" ]]; then
     cp -p -- "$wad" "$mount_root/Windows/System32/doom1.wad"
 fi
+# The native client plays a 440 Hz self-test tone when this marker exists,
+# giving the host-side WAV capture a deterministic spectrum to look for.
+if [[ "${WIN0DOOM_AUDIO_SELFTEST:-0}" == 1 ]]; then
+    : > "$mount_root/Windows/System32/win0-audio-selftest"
+fi
+# Diagnostic: tee the client's submitted PCM to win0doom-client.pcm.
+if [[ "${WIN0DOOM_AUDIO_DUMP:-0}" == 1 ]]; then
+    : > "$mount_root/Windows/System32/win0-audio-dump"
+fi
 sync -f "$mount_root"
 printf 'installed Win0 Doom payload into %s.\n' "$image"

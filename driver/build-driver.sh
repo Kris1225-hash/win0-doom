@@ -9,24 +9,34 @@ llvm_bin="/usr/lib/llvm/22/bin"
 
 mkdir -p "$build_dir"
 
+compile_flags=(
+  /c /nologo /kernel /GS- /GR- /Zl /W4
+  /clang:-Wno-nonportable-include-path
+  /clang:-Wno-unknown-pragmas
+  /clang:-Wno-ignored-pragma-intrinsic
+  /clang:-Wno-pragma-pack
+  /D_AMD64_ /D_WIN64 /D_KERNEL_MODE
+  /I"$sdk_root/Include/$sdk_version/km/crt"
+  /I"$sdk_root/Include/$sdk_version/shared"
+  /I"$sdk_root/Include/$sdk_version/km"
+)
+
 "$llvm_bin/clang-cl" \
-  /c /nologo /kernel /GS- /GR- /Zl /W4 \
-  /clang:-Wno-nonportable-include-path \
-  /clang:-Wno-unknown-pragmas \
-  /clang:-Wno-ignored-pragma-intrinsic \
-  /clang:-Wno-pragma-pack \
-  /D_AMD64_ /D_WIN64 /D_KERNEL_MODE \
-  /I"$sdk_root/Include/$sdk_version/km/crt" \
-  /I"$sdk_root/Include/$sdk_version/shared" \
-  /I"$sdk_root/Include/$sdk_version/km" \
+  "${compile_flags[@]}" \
   /Fo"$build_dir/win0doom-display.obj" \
   "$driver_dir/win0doom-display.c"
+
+"$llvm_bin/clang-cl" \
+  "${compile_flags[@]}" \
+  /Fo"$build_dir/win0doom-audio.obj" \
+  "$driver_dir/win0doom-audio.c"
 
 "$llvm_bin/lld-link" \
   /nologo /driver /release /machine:x64 /subsystem:native \
   /entry:DriverEntry /nodefaultlib \
   /out:"$build_dir/win0doom-display.sys" \
   "$build_dir/win0doom-display.obj" \
+  "$build_dir/win0doom-audio.obj" \
   "$sdk_root/Lib/$sdk_version/km/x64/ntoskrnl.lib" \
   "$sdk_root/Lib/$sdk_version/km/x64/hal.lib"
 
