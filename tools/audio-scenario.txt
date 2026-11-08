@@ -1,0 +1,28 @@
+# Default key scenario for tools/audio-capture.sh, injected one HMP
+# `sendkey` per socat invocation ~300 ms apart (the only injection rate ccs
+# accepts reliably at runlevel 0; see setup/linux.md).
+#
+# Syntax: a bare HMP key name, `key <name>`, `sleep <seconds>`, or
+# `screendump <name>`. Zero-duration scenarios are valid: the attract demo
+# already emits monster and weapon sounds if audio is wired up at all.
+#
+# This sequence lets the booted attract demo play for 10 s, then starts a new
+# game (escape -> new game -> episode one -> default skill, proven in NEXT.md)
+# and fires the pistol three times to place deterministic weapon sounds in
+# the capture.
+
+sleep 10
+esc
+sleep 1
+ret
+sleep 1
+ret
+sleep 1
+ret
+sleep 2
+ctrl
+sleep 1.5
+ctrl
+sleep 1.5
+ctrl
+sleep 2
