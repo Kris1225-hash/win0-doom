@@ -110,6 +110,8 @@ NTSYSAPI NTSTATUS NTAPI ZwWaitForSingleObject(
 #define WIN0DOOM_AUDIO_DMA_LIMIT 0x1000000ULL /* keep below the 16 MiB page limit */
 #define WIN0DOOM_AUDIO_DMA_BOUNDARY 0x10000ULL
 #define WIN0DOOM_AUDIO_DMA_LEAD (WIN0DOOM_AUDIO_DMA_BYTES / 2UL)
+/* Tolerated backward cursor jitter: twice the worst torn count read. */
+#define WIN0DOOM_AUDIO_RESYNC_SLACK 1024UL
 #define WIN0DOOM_AUDIO_CHUNK 1024UL
 #define WIN0DOOM_AUDIO_LOG_MAX 32768UL
 #define WIN0DOOM_AUDIO_LOG_LINE_BYTES 256UL
@@ -425,6 +427,9 @@ static VOID Win0DoomAudioLogRun(VOID)
     Win0DoomAudioLogDecimal(&line, blocks);
     Win0DoomAudioLogText(&line, " silence=");
     Win0DoomAudioLogDecimal(&line, silence);
+    /* Pump-thread state; this runs on the pump thread. */
+    Win0DoomAudioLogText(&line, " resyncs=");
+    Win0DoomAudioLogDecimal(&line, g_Audio.DmaResyncs);
     Win0DoomAudioLogText(&line, " ready=");
     Win0DoomAudioLogDecimal(&line, ready);
     Win0DoomAudioLogFlush(&line);
@@ -531,7 +536,7 @@ static VOID Win0DoomAudioProgramDma(VOID)
  * assembled 16-bit value is val >> 1: a WORD count, 16383 - fetched_bytes/2.
  * Clear the byte-pointer flip-flop first so the two reads are low then high.
  */
-static ULONG Win0DoomAudioReadDmaCount(VOID)
+static ULONG Win0DoomAudioReadDmaCountOnce(VOID)
 {
     UCHAR low;
     UCHAR high;
@@ -540,6 +545,30 @@ static ULONG Win0DoomAudioReadDmaCount(VOID)
     low = READ_PORT_UCHAR((PUCHAR)(ULONG_PTR)DMA_CHANNEL5_COUNT_PORT);
     high = READ_PORT_UCHAR((PUCHAR)(ULONG_PTR)DMA_CHANNEL5_COUNT_PORT);
     return ((ULONG)high << 8) | (ULONG)low;
+}
+
+/*
+ * The low and high bytes are two separate port reads, and qemu's DMA engine
+ * (an i8257 bottom half on the main loop) can advance between them: a borrow
+ * out of the low byte then assembles a count up to 255 words too low, a
+ * cursor ~0.5 KiB ahead of the truth. The engine moves in bursts, so repeat
+ * the pair until two consecutive values agree (bounded; the last value is
+ * used if the controller never settles).
+ */
+static ULONG Win0DoomAudioReadDmaCount(VOID)
+{
+    ULONG previous = Win0DoomAudioReadDmaCountOnce();
+    ULONG attempt;
+
+    for (attempt = 0; attempt < 4; ++attempt) {
+        ULONG current = Win0DoomAudioReadDmaCountOnce();
+
+        if (current == previous) {
+            return current;
+        }
+        previous = current;
+    }
+    return previous;
 }
 
 static NTSTATUS Win0DoomAudioStartDsp(VOID)
@@ -865,22 +894,34 @@ static VOID Win0DoomAudioPumpThread(PVOID Context)
              * fillOffset is an absolute buffer cursor that advances only
              * with the bytes taken from the ring, so the stream stays
              * byte-locked to the playhead.  Keep it between pos and one
-             * lead ahead; if it fell behind (a big fetch burst or a
-             * restart), re-lock it one lead ahead and count the skip.
+             * lead ahead.  Every fill ends exactly one lead ahead, so a
+             * cursor read that lands slightly behind the previous one shows
+             * up just above LEAD: the queued PCM is still ahead of the real
+             * cursor, so write nothing this pass instead of rewinding over
+             * it.  Beyond that slack the fill cursor really fell behind, or
+             * less than half a lead is left: re-lock one lead ahead and
+             * silence the skipped window, which otherwise still holds PCM
+             * from the previous lap of the buffer (~743 ms old) and would
+             * play again.
              */
             ahead = (g_Audio.FillOffset - position) & (g_Audio.DmaBytes - 1);
-            if (ahead > g_Audio.DmaBytes - WIN0DOOM_AUDIO_DMA_LEAD) {
-                /* Fill pointer fell behind (or absurdly ahead of) the playhead. */
-                g_Audio.FillOffset = (position + WIN0DOOM_AUDIO_DMA_LEAD) &
-                    (g_Audio.DmaBytes - 1);
-                g_Audio.DmaResyncs++;
+            if (ahead > WIN0DOOM_AUDIO_DMA_LEAD &&
+                ahead <= WIN0DOOM_AUDIO_DMA_LEAD + WIN0DOOM_AUDIO_RESYNC_SLACK) {
                 ahead = WIN0DOOM_AUDIO_DMA_LEAD;
-            } else if (ahead < WIN0DOOM_AUDIO_DMA_LEAD / 2) {
-                /*
-                 * A fetch burst consumed more than half the lead between two
-                 * samples; never write within LEAD/2 of the live cursor.
-                 * Skip this window and re-lock one full lead ahead.
-                 */
+            } else if (ahead > g_Audio.DmaBytes - WIN0DOOM_AUDIO_DMA_LEAD ||
+                       ahead < WIN0DOOM_AUDIO_DMA_LEAD / 2) {
+                ULONG skipped;
+
+                if (ahead > g_Audio.DmaBytes - WIN0DOOM_AUDIO_DMA_LEAD) {
+                    /* Fell behind: everything from the cursor on is stale. */
+                    skipped = WIN0DOOM_AUDIO_DMA_LEAD;
+                    Win0DoomAudioFillSilence(position, skipped);
+                } else {
+                    /* Short: keep what is queued, silence the rest. */
+                    skipped = WIN0DOOM_AUDIO_DMA_LEAD - ahead;
+                    Win0DoomAudioFillSilence(g_Audio.FillOffset, skipped);
+                }
+                silence += skipped;
                 g_Audio.FillOffset = (position + WIN0DOOM_AUDIO_DMA_LEAD) &
                     (g_Audio.DmaBytes - 1);
                 g_Audio.DmaResyncs++;
