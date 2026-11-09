@@ -5,7 +5,7 @@ native_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 build_dir="$native_dir/build"
 sdk_root="${WINDOWS_SDK_ROOT:-$native_dir/../toolchain/wdk-26100/c}"
 sdk_version="10.0.26100.0"
-llvm_bin="/usr/lib/llvm/22/bin"
+llvm_bin="${LLVM_BIN:-/usr/lib/llvm/22/bin}"
 
 mkdir -p "$build_dir"
 
