@@ -249,6 +249,20 @@ sleep_until() {
     done
 }
 
+# HMP splits its arguments on whitespace; get_str() in qemu's monitor/hmp.c
+# accepts a double-quoted string with \" and \\ escapes, so quote any file
+# name sent to the monitor (the artifacts path may contain spaces).
+hmp_quote() {
+    local text=${1//\\/\\\\}
+    text=${text//\"/\\\"}
+    printf '"%s"' "$text"
+}
+
+# qemu option values are comma-separated; a literal comma is written ",,".
+qemu_opt() {
+    printf '%s' "${1//,/,,}"
+}
+
 hmp() {
     local command=$1 timeout=${2:-3} output status=0
     output=$(printf '%s\n' "$command" | socat -t "$timeout" - \
@@ -284,7 +298,7 @@ capture_screendump() {
     ppm=$artifacts/$name.ppm
     mkdir -p -- "$(dirname -- "$ppm")"
     rm -f -- "$ppm"
-    if ! hmp "screendump $ppm" 5; then
+    if ! hmp "screendump $(hmp_quote "$ppm")" 5; then
         printf 'audio-capture: warning: screendump monitor command failed: %s\n' "$ppm" >&2
     fi
     local i size last=-1 magic
@@ -475,20 +489,20 @@ qemu_args=(
     -cpu host
     -smp 4
     -m 8G
-    -drive "if=pflash,format=raw,readonly=on,file=$ovmf_code"
-    -drive "if=pflash,format=raw,file=$ovmf_vars"
-    -drive "if=none,id=system_disk,format=qcow2,cache=writeback,discard=unmap,file=$image"
+    -drive "if=pflash,format=raw,readonly=on,file=$(qemu_opt "$ovmf_code")"
+    -drive "if=pflash,format=raw,file=$(qemu_opt "$ovmf_vars")"
+    -drive "if=none,id=system_disk,format=qcow2,cache=writeback,discard=unmap,file=$(qemu_opt "$image")"
     -device "ide-hd,drive=system_disk,bus=ide.0,bootindex=1"
     -vga std
     -display none
-    -monitor "unix:$monitor,server=on,wait=off"
+    -monitor "unix:$(qemu_opt "$monitor"),server=on,wait=off"
     -nic none
     -global ICH9-LPC.disable_s3=1
 )
 if [ "$audio_enabled" -eq 1 ]; then
     qemu_args+=(
         -device sb16,audiodev=snd0
-        -audiodev "wav,id=snd0,path=$artifacts/capture.wav"
+        -audiodev "wav,id=snd0,path=$(qemu_opt "$artifacts/capture.wav")"
     )
 fi
 
