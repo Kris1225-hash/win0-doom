@@ -388,10 +388,16 @@ static VOID Win0DoomReadDisplayGeometry(PWIN0DOOM_CONTROL_EXTENSION Extension)
         return;
     }
     stride = virtual_width * (bpp / 8);
-    aperture_needed = (ULONG64)stride * (ULONG64)virtual_height;
+    /*
+     * The blit only writes inside the visible mode (the centered image ends
+     * at or before row yres), so that is what must fit in the mapping. Do not
+     * use virtual_height here: QEMU sets it to vbe_size / stride, i.e. about
+     * the whole VRAM, so with vgamem_mb > 16 every mode would be rejected.
+     */
+    aperture_needed = (ULONG64)stride * (ULONG64)yres;
     if (aperture_needed > (ULONG64)WIN0DOOM_DISPLAY_BYTES) {
         DbgPrint(
-            "Win0DoomDisplay: DISPI geometry needs %llu bytes, aperture is %lu bytes\n",
+            "Win0DoomDisplay: DISPI visible mode needs %llu bytes, aperture is %lu bytes\n",
             (unsigned long long)aperture_needed,
             WIN0DOOM_DISPLAY_BYTES
         );
