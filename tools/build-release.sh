@@ -30,7 +30,9 @@
 #   WIN0DOOM_SIGN_PASSWORD      pfx password (default: empty)
 #   WIN0DOOM_SIGN_NAME          signature description text
 #                               (default: "Win0 Doom display and keyboard bridge")
-#   LLVM_BIN                    directory holding clang-cl/lld-link/llvm-readobj
+#   LLVM_BIN                    directory holding clang-cl/lld-link/llvm-readobj/llvm-nm;
+#                               passed to the build scripts as well, so one
+#                               toolchain both builds and inspects the release
 #                               (default: /usr/lib/llvm/22/bin)
 #
 # The WDK OEM test root certificate has no CA basic-constraints extension, so
@@ -191,9 +193,9 @@ say "build-release: intermediate=$intermediate"
 
 say ''
 say '== build =='
-WINDOWS_SDK_ROOT="$sdk_root" "$repo_dir/native/build-win0-doom.sh"
-WINDOWS_SDK_ROOT="$sdk_root" "$repo_dir/native/build-input-probe.sh"
-WINDOWS_SDK_ROOT="$sdk_root" "$repo_dir/driver/build-driver.sh"
+WINDOWS_SDK_ROOT="$sdk_root" LLVM_BIN="$llvm_bin" "$repo_dir/native/build-win0-doom.sh"
+WINDOWS_SDK_ROOT="$sdk_root" LLVM_BIN="$llvm_bin" "$repo_dir/native/build-input-probe.sh"
+WINDOWS_SDK_ROOT="$sdk_root" LLVM_BIN="$llvm_bin" "$repo_dir/driver/build-driver.sh"
 
 say ''
 say '== sign =='
