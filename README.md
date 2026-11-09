@@ -85,7 +85,8 @@ paths — the game submits PCM to the driver, and the driver owns the hardware.
 - `driver/win0doom-audio.c` keeps a 64 KiB drop-oldest ring and a 32 KiB
   physically contiguous DMA buffer. a PASSIVE pump thread resets and
   configures the emulated SB16 (16-bit stereo, auto-init, DSP 4.5), programs
-  8237 channel 5 and refills the buffer half a block behind the play cursor.
+  8237 channel 5 and keeps the buffer filled 16 KiB (half the buffer,
+  ~371 ms) ahead of the play cursor.
   the cursor is read from the DMA controller itself, not estimated from wall
   time; a time-based estimate drifted by a non-4-byte amount and rotated the
   16-bit sample stream, which turns quiet audio into full-scale noise.
