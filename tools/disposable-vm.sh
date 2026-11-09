@@ -84,8 +84,13 @@ done
 
 [[ -n "$base" ]] || base="${WIN0DOOM_BASE_IMAGE:-}"
 [[ -n "$base" ]] || { usage; die 'a base image is required (--base IMAGE.qcow2)'; }
-if [[ -n "$seconds" && ! "$seconds" =~ ^[0-9]+$ ]]; then
-    die "--seconds must be a whole number of seconds: $seconds"
+if [[ -n "$seconds" ]]; then
+    [[ "$seconds" =~ ^[0-9]+$ ]] ||
+        die "--seconds must be a whole number of seconds: $seconds"
+    # tools/audio-capture.sh refuses less than 75 s (boot.ppm is taken at
+    # 60 s). Fail here, before the build, copy and sudo deploy, not after.
+    (( 10#$seconds >= 75 )) ||
+        die "--seconds must be at least 75 (tools/audio-capture.sh takes boot.ppm at 60 s): $seconds"
 fi
 
 stamp="$(date -u +%Y%m%d-%H%M%S)"
