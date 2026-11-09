@@ -251,12 +251,25 @@ check_image() {
     if (( dry_run )); then
         return 0
     fi
-    if ! qemu-img check -- "$image"; then
-        printf 'error: %s failed qemu-img check; removing the copy\n' "$image" >&2
-        rm -f -- "$image"
-        image_created=0
-        return 1
-    fi
+    local status=0
+    qemu-img check -- "$image" || status=$?
+    case "$status" in
+        0) ;;
+        3)
+            # qemu-img(1): exit 3 = leaked clusters only, image not corrupted.
+            # A base that was ever attached to a qemu that crashed or was
+            # killed carries them into every copy; that wastes space, it does
+            # not lose data.
+            printf 'note: %s has leaked clusters (qemu-img check exit 3) but is consistent; continuing\n' \
+                "$image" >&2
+            ;;
+        *)
+            printf 'error: %s failed qemu-img check (exit %s); removing the copy\n' "$image" "$status" >&2
+            rm -f -- "$image"
+            image_created=0
+            return 1
+            ;;
+    esac
 }
 check_image
 if (( ! dry_run )); then
