@@ -203,7 +203,6 @@ static WIN0DOOM_AUDIO_STATE g_Audio;
 
 static NTSTATUS Win0DoomAudioStartDsp(VOID);
 static VOID Win0DoomAudioStopDsp(VOID);
-static ULONG Win0DoomAudioFillAhead(ULONG PlayOffset, ULONG *BufferedAhead);
 static VOID Win0DoomAudioPumpThread(PVOID Context);
 
 /* ------------------------------------------------------------------ */
@@ -740,37 +739,6 @@ static VOID Win0DoomAudioFillSilence(ULONG Offset, ULONG Length)
     }
 }
 
-/*
- * Fill the DMA buffer from PlayOffset + *BufferedAhead up to one lead
- * (half a buffer) ahead, taking PCM from the ring and counting the bytes
- * that had to be replaced with silence.  The caller owns the position
- * bookkeeping; this runs only on the pump thread.
- */
-static ULONG Win0DoomAudioFillAhead(ULONG PlayOffset, ULONG *BufferedAhead)
-{
-    ULONG offset = (PlayOffset + *BufferedAhead) & (g_Audio.DmaBytes - 1);
-    ULONG silence = 0;
-
-    while (*BufferedAhead < WIN0DOOM_AUDIO_DMA_LEAD) {
-        UCHAR chunk[WIN0DOOM_AUDIO_CHUNK];
-        ULONG want = WIN0DOOM_AUDIO_DMA_LEAD - *BufferedAhead;
-        ULONG got;
-
-        if (want > WIN0DOOM_AUDIO_CHUNK) {
-            want = WIN0DOOM_AUDIO_CHUNK;
-        }
-        got = Win0DoomAudioRingRead(chunk, want);
-        Win0DoomAudioCopyToDma(offset, chunk, got);
-        if (got < want) {
-            Win0DoomAudioFillSilence((offset + got) & (g_Audio.DmaBytes - 1), want - got);
-            silence += want - got;
-        }
-        offset = (offset + want) & (g_Audio.DmaBytes - 1);
-        *BufferedAhead += want;
-    }
-    return silence;
-}
-
 static ULONG64 Win0DoomAudioTicksToBytes(ULONG64 Ticks, ULONG64 Frequency)
 {
     ULONG64 seconds;
@@ -799,7 +767,6 @@ static VOID Win0DoomAudioPumpThread(PVOID Context)
     ULONG64 playedRun = 0;
     ULONG64 playedBase = 0;
     ULONG primeSilence = 0;
-    ULONG primed = 0;
     BOOLEAN running;
     NTSTATUS status;
     KIRQL irql;
@@ -808,9 +775,15 @@ static VOID Win0DoomAudioPumpThread(PVOID Context)
 
     Win0DoomAudioLogInit();
 
+    /*
+     * Prime the first lead with silence only and leave the ring alone. PCM
+     * queued around a (re)start then plays contiguously from FillOffset
+     * (= LEAD) instead of being split by the silence the prime used to pad
+     * it with: a first self-test block that won the race with the
+     * CREATE-triggered restart was followed by ~325 ms of silence.
+     */
     RtlZeroMemory(g_Audio.DmaBuffer, g_Audio.DmaBytes);
-    primed = 0;
-    primeSilence = Win0DoomAudioFillAhead(0, &primed);
+    primeSilence = WIN0DOOM_AUDIO_DMA_LEAD;
     status = Win0DoomAudioStartDsp();
     running = NT_SUCCESS(status);
     startTime = KeQueryPerformanceCounter(&frequency);
@@ -834,9 +807,8 @@ static VOID Win0DoomAudioPumpThread(PVOID Context)
                 playedBase += playedRun;
             }
             playedRun = 0;
-            primed = 0;
             RtlZeroMemory(g_Audio.DmaBuffer, g_Audio.DmaBytes);
-            primeSilence = Win0DoomAudioFillAhead(0, &primed);
+            primeSilence = WIN0DOOM_AUDIO_DMA_LEAD; /* silence only, see above */
             status = Win0DoomAudioStartDsp();
             running = NT_SUCCESS(status);
             startTime = KeQueryPerformanceCounter(&frequency);
