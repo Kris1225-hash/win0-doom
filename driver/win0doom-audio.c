@@ -118,6 +118,8 @@ NTSYSAPI NTSTATUS NTAPI ZwWaitForSingleObject(
 #define WIN0DOOM_AUDIO_PORT_TIMEOUT 100000UL        /* 1 us stalls */
 
 #define SB16_BASE 0x220
+#define SB16_MIXER_INDEX (SB16_BASE + 0x04)
+#define SB16_MIXER_DATA (SB16_BASE + 0x05)
 #define SB16_DSP_RESET (SB16_BASE + 0x06)
 #define SB16_DSP_READ_DATA (SB16_BASE + 0x0a)
 #define SB16_DSP_WRITE_DATA (SB16_BASE + 0x0c)
@@ -132,6 +134,8 @@ NTSYSAPI NTSTATUS NTAPI ZwWaitForSingleObject(
 #define SB16_DSP_CMD_EXIT_16BIT_AUTO 0xd9
 #define SB16_DSP_CMD_VERSION 0xe1
 #define SB16_DSP_FORMAT_S16_STEREO 0x30
+#define SB16_MIXER_IRQ_SELECT 0x80 /* sb16.c: magic_of_irq(irq), 0x02 = IRQ 5 */
+#define SB16_MIXER_DMA_SELECT 0x81 /* sb16.c: (1 << dma) | (1 << hdma), 0x22 = 1 and 5 */
 
 #define WIN0DOOM_AUDIO_DMA_CHANNEL 5
 #define DMA_MASK_PORT 0xd4
@@ -180,6 +184,13 @@ typedef struct _WIN0DOOM_AUDIO_STATE {
 
     UCHAR DspResetAck;
     ULONG DspVersion;
+
+    /* What the last start actually programmed and read back, for the log. */
+    ULONG ProgrammedRate;  /* rate sent with 0x41, 0 if that step failed */
+    UCHAR ProgrammedMode;  /* 8237 mode byte written, 0 if not reached */
+    ULONG StartCount;      /* channel-5 count read after 0xB6, ~0 if not reached */
+    UCHAR MixerIrqSelect;  /* SB16 mixer 0x80 */
+    UCHAR MixerDmaSelect;  /* SB16 mixer 0x81 */
 
     HANDLE LogHandle;
     ULONG LogBytes;
@@ -348,6 +359,13 @@ static VOID Win0DoomAudioLogInit(VOID)
     Win0DoomAudioLogFlush(&line);
 }
 
+/*
+ * Everything after version= is what this start actually programmed (0 when
+ * the step was not reached) or read back from the hardware: the channel-5
+ * count right after 0xB6 and the SB16 mixer's IRQ/DMA select registers. A
+ * failed start therefore no longer prints the intended rate and mode as if
+ * they had been applied.
+ */
 static VOID Win0DoomAudioLogDspStart(NTSTATUS Status)
 {
     WIN0DOOM_AUDIO_LOG_LINE line;
@@ -358,9 +376,19 @@ static VOID Win0DoomAudioLogDspStart(NTSTATUS Status)
     Win0DoomAudioLogText(&line, " version=0x");
     Win0DoomAudioLogHex(&line, g_Audio.DspVersion, 4);
     Win0DoomAudioLogText(&line, " rate=");
-    Win0DoomAudioLogDecimal(&line, WIN0DOOM_PCM_SAMPLE_RATE);
-    Win0DoomAudioLogText(&line, " dma=0x");
-    Win0DoomAudioLogHex(&line, DMA_MODE_16BIT_AUTO_SINGLE, 2);
+    Win0DoomAudioLogDecimal(&line, g_Audio.ProgrammedRate);
+    Win0DoomAudioLogText(&line, " mode=0x");
+    Win0DoomAudioLogHex(&line, g_Audio.ProgrammedMode, 2);
+    if (g_Audio.StartCount == (ULONG)-1) {
+        Win0DoomAudioLogText(&line, " count0=none");
+    } else {
+        Win0DoomAudioLogText(&line, " count0=0x");
+        Win0DoomAudioLogHex(&line, g_Audio.StartCount, 4);
+    }
+    Win0DoomAudioLogText(&line, " irqsel=0x");
+    Win0DoomAudioLogHex(&line, g_Audio.MixerIrqSelect, 2);
+    Win0DoomAudioLogText(&line, " dmasel=0x");
+    Win0DoomAudioLogHex(&line, g_Audio.MixerDmaSelect, 2);
     Win0DoomAudioLogText(&line, " status=0x");
     Win0DoomAudioLogHex(&line, (ULONG)Status, 8);
     Win0DoomAudioLogFlush(&line);
@@ -469,6 +497,13 @@ static ULONG Win0DoomAudioDspVersion(VOID)
     return ((ULONG)major << 8) | minor;
 }
 
+/* Mixer index at base+4, data at base+5 (sb16.c sb16_ioport_list). */
+static UCHAR Win0DoomAudioMixerRead(UCHAR Index)
+{
+    WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)SB16_MIXER_INDEX, Index);
+    return READ_PORT_UCHAR((PUCHAR)(ULONG_PTR)SB16_MIXER_DATA);
+}
+
 static VOID Win0DoomAudioProgramDma(VOID)
 {
     ULONG64 physical = (ULONG64)g_Audio.DmaPhysical.QuadPart;
@@ -479,6 +514,7 @@ static VOID Win0DoomAudioProgramDma(VOID)
     WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)DMA_MASK_PORT, (UCHAR)(0x04 | (WIN0DOOM_AUDIO_DMA_CHANNEL & 3)));
     WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)DMA_CLEAR_FLIPFLOP_PORT, 0);
     WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)DMA_MODE_PORT, DMA_MODE_16BIT_AUTO_SINGLE);
+    g_Audio.ProgrammedMode = DMA_MODE_16BIT_AUTO_SINGLE;
     WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)DMA_CHANNEL5_ADDRESS_PORT, (UCHAR)(wordAddress & 0xff));
     WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)DMA_CHANNEL5_ADDRESS_PORT, (UCHAR)((wordAddress >> 8) & 0xff));
     WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)DMA_CHANNEL5_COUNT_PORT, (UCHAR)(count & 0xff));
@@ -512,6 +548,12 @@ static NTSTATUS Win0DoomAudioStartDsp(VOID)
     ULONG count;
 
     g_Audio.DspVersion = 0;
+    g_Audio.ProgrammedRate = 0;
+    g_Audio.ProgrammedMode = 0;
+    g_Audio.StartCount = (ULONG)-1;
+    /* Read before the reset so an absent card is visible as 0xff here. */
+    g_Audio.MixerIrqSelect = Win0DoomAudioMixerRead(SB16_MIXER_IRQ_SELECT);
+    g_Audio.MixerDmaSelect = Win0DoomAudioMixerRead(SB16_MIXER_DMA_SELECT);
     status = Win0DoomAudioResetDsp();
     if (!NT_SUCCESS(status)) {
         return status;
@@ -527,6 +569,7 @@ static NTSTATUS Win0DoomAudioStartDsp(VOID)
         !Win0DoomAudioDspWrite(0x11)) {
         return STATUS_IO_TIMEOUT;
     }
+    g_Audio.ProgrammedRate = WIN0DOOM_PCM_SAMPLE_RATE;
 
     Win0DoomAudioProgramDma();
     count = g_Audio.DmaBytes / 2UL - 1UL;
@@ -547,6 +590,7 @@ static NTSTATUS Win0DoomAudioStartDsp(VOID)
      * or a floating bus and is not usable as an anchor.
      */
     g_Audio.DmaAnchorCount = Win0DoomAudioReadDmaCount();
+    g_Audio.StartCount = g_Audio.DmaAnchorCount;
     if (g_Audio.DmaAnchorCount <= g_Audio.DmaBytes / 2UL - 1UL) {
         g_Audio.DmaAnchorPosition =
             (g_Audio.DmaBytes - 2UL - g_Audio.DmaAnchorCount * 2UL) &
