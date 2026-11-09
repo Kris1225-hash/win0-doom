@@ -40,8 +40,10 @@
 # chain even though Windows test signing accepts it.  The verification below
 # requires the Authenticode digest to match the file, the PE checksum to cover
 # the signed overlay, an independent PKCS#7 signature check with `openssl
-# smime -verify -noverify` (OpenSSL's PKCS7_verify aborts at the chain before
-# touching the RSA signature), and the signer to be the certificate from the
+# smime -verify -noverify -content` (OpenSSL's PKCS7_verify aborts at the
+# chain before touching the RSA signature; the signed SpcIndirectDataContent
+# body is passed explicitly so OpenSSL 3.0-3.4 digest the same bytes as 3.5+),
+# and the signer to be the certificate from the
 # pfx; a chain failure is tolerated only when OpenSSL fails for that specific
 # trust-anchor reason and nothing else.  Any other error, a digest or
 # checksum mismatch, a missing signature, or a different signer fails the
@@ -236,6 +238,26 @@ pe_imports() {
 # signature verification
 # ---------------------------------------------------------------------------
 
+# Authenticode signs the body of SpcIndirectDataContent (content type
+# 1.3.6.1.4.1.311.2.1.4): the SEQUENCE contents without their tag and length.
+# OpenSSL 3.5+ extracts that body itself, but earlier releases hash an empty
+# body for any content type other than "data", so `openssl smime -verify`
+# reports "digest failure" for every valid Authenticode signature on
+# OpenSSL 3.0-3.4.  Cut the body out of the DER blob and pass it with
+# -content; every OpenSSL 3 release then digests the same bytes.
+authenticode_content() {
+    local blob="$1" out="$2" offset='' header='' length=''
+    read -r offset header length < <(
+        openssl asn1parse -inform DER -in "$blob" 2>/dev/null |
+            sed -n '/:1\.3\.6\.1\.4\.1\.311\.2\.1\.4 *$/,$p' |
+            sed -n '/cons: SEQUENCE/{s/^ *\([0-9]*\):d= *[0-9]* *hl=\([0-9]*\) *l= *\([0-9]*\) .*/\1 \2 \3/p;q;}'
+    ) || true
+    [[ "$offset" =~ ^[0-9]+$ && "$header" =~ ^[0-9]+$ && "$length" =~ ^[0-9]+$ ]] ||
+        return 1
+    tail -c "+$((offset + header + 1))" -- "$blob" | head -c "$length" >"$out"
+    [[ "$(file_size "$out")" == "$length" ]]
+}
+
 signature_status='unverified'
 verify_signature() {
     local log="$work_dir/osslsigncode-verify.log"
@@ -273,13 +295,18 @@ verify_signature() {
     # verification before it ever checks the RSA signature.  A corrupt
     # signature must not hide behind the tolerated chain error, so verify the
     # extracted PKCS#7 signature separately (signature over the signed
-    # attributes and their message digest, chain ignored).
+    # attributes and their message digest, chain ignored).  The signed
+    # content is passed explicitly: see authenticode_content().
     signature_blob="$work_dir/signature.p7"
+    signed_content="$work_dir/signature.content"
     "$signer" extract-signature -in "$signed_driver" -out "$signature_blob" >/dev/null 2>&1 ||
         fail "cannot extract the Authenticode signature from $signed_driver"
     command -v openssl >/dev/null ||
         fail 'openssl is required to verify the Authenticode signature independently'
-    if ! openssl smime -verify -inform DER -in "$signature_blob" -noverify -out /dev/null >/dev/null 2>&1; then
+    authenticode_content "$signature_blob" "$signed_content" ||
+        fail "cannot find SpcIndirectDataContent in the Authenticode signature of $signed_driver"
+    if ! openssl smime -verify -inform DER -in "$signature_blob" -noverify \
+            -content "$signed_content" -out /dev/null >/dev/null 2>&1; then
         fail "the Authenticode signature does not verify against the signed attributes in $signed_driver"
     fi
 
