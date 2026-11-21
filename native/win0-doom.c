@@ -636,14 +636,12 @@ static BOOLEAN audio_write_block(const void *block, ULONG length)
     return FALSE;
 }
 
-static void audio_report_status(void)
+static NTSTATUS audio_query_status(WIN0DOOM_AUDIO_STATUS *audio_status)
 {
     IO_STATUS_BLOCK io_status;
-    WIN0DOOM_AUDIO_STATUS audio_status;
-    NTSTATUS status;
 
-    memset(&audio_status, 0, sizeof(audio_status));
-    status = NtDeviceIoControlFile(
+    memset(audio_status, 0, sizeof(*audio_status));
+    return NtDeviceIoControlFile(
         display_handle,
         NULL,
         NULL,
@@ -652,10 +650,16 @@ static void audio_report_status(void)
         WIN0DOOM_IOCTL_SOUND_STATUS,
         NULL,
         0,
-        &audio_status,
-        sizeof(audio_status)
+        audio_status,
+        sizeof(*audio_status)
     );
-    if (status < 0) {
+}
+
+static void audio_report_status(void)
+{
+    WIN0DOOM_AUDIO_STATUS audio_status;
+
+    if (audio_query_status(&audio_status) < 0) {
         return;
     }
     native_print("\r\nwin0 doom: audio sample rate ");
@@ -679,8 +683,20 @@ static BOOLEAN audio_selftest_requested(void)
 }
 
 /*
- * Submit 1.0 s of 440 Hz stereo sine followed by 0.25 s of silence, paced at
- * the PCM block cadence so the driver ring sees exactly one block per period.
+ * The driver's pump never waits for data: whenever the ring is empty at a
+ * pump pass it writes silence. The self-test therefore queues a cushion of
+ * blocks first and paces the rest against an absolute deadline. A relative
+ * 46.44 ms sleep always overslept to the next clock tick (>= 46.875 ms at
+ * the default 15.625 ms tick), so the tone was submitted slower than it
+ * played and every block was followed by a sliver of silence.
+ */
+#define WIN0DOOM_SELFTEST_CUSHION_BLOCKS 4UL
+#define WIN0DOOM_SELFTEST_DRAIN_POLLS 50UL
+#define WIN0DOOM_SELFTEST_DRAIN_POLL_TICKS 200000LL /* 20 ms */
+
+/*
+ * Submit 1.0 s of 440 Hz stereo sine followed by 0.25 s of silence, keeping
+ * a few blocks queued ahead of the pump so the tone plays without gaps.
  * Gives the host harness a deterministic spectral peak before the demo starts.
  */
 static void audio_selftest(void)
@@ -691,8 +707,13 @@ static void audio_selftest(void)
     const ULONG total_frames =
         WIN0DOOM_SELFTEST_TONE_FRAMES + WIN0DOOM_SELFTEST_SILENCE_FRAMES;
     ULONG written_frames = 0;
+    ULONG written_blocks = 0;
     ULONG phase = 0;
+    LARGE_INTEGER now;
+    LONGLONG deadline;
 
+    NtQuerySystemTime(&now);
+    deadline = now.QuadPart;
     while (written_frames < total_frames) {
         ULONG frames = total_frames - written_frames;
         ULONG tone_frames = 0;
@@ -722,12 +743,36 @@ static void audio_selftest(void)
             return;
         }
         written_frames += frames;
-        if (written_frames < total_frames) {
-            LARGE_INTEGER block_delay;
+        ++written_blocks;
+        if (written_frames < total_frames &&
+            written_blocks >= WIN0DOOM_SELFTEST_CUSHION_BLOCKS) {
+            deadline += WIN0DOOM_AUDIO_BLOCK_TICKS;
+            NtQuerySystemTime(&now);
+            if (deadline > now.QuadPart) {
+                LARGE_INTEGER block_delay;
 
-            block_delay.QuadPart = -WIN0DOOM_AUDIO_BLOCK_TICKS;
-            NtDelayExecution(FALSE, &block_delay);
+                block_delay.QuadPart = -(deadline - now.QuadPart);
+                NtDelayExecution(FALSE, &block_delay);
+            }
         }
+    }
+
+    /*
+     * Let the cushion drain out of the ring before doom starts, so it does
+     * not stay queued as extra latency for the game's sound effects.
+     * Bounded: without a working device nothing drains the ring.
+     */
+    for (ULONG poll = 0; poll < WIN0DOOM_SELFTEST_DRAIN_POLLS; ++poll) {
+        WIN0DOOM_AUDIO_STATUS audio_status;
+        LARGE_INTEGER poll_delay;
+
+        if (audio_query_status(&audio_status) < 0 ||
+            audio_status.DeviceReady == 0 ||
+            audio_status.RingQueuedBytes == 0) {
+            break;
+        }
+        poll_delay.QuadPart = -WIN0DOOM_SELFTEST_DRAIN_POLL_TICKS;
+        NtDelayExecution(FALSE, &poll_delay);
     }
     native_print("\r\nwin0 doom: audio selftest submitted\r\n");
 }

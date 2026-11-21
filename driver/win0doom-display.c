@@ -388,10 +388,16 @@ static VOID Win0DoomReadDisplayGeometry(PWIN0DOOM_CONTROL_EXTENSION Extension)
         return;
     }
     stride = virtual_width * (bpp / 8);
-    aperture_needed = (ULONG64)stride * (ULONG64)virtual_height;
+    /*
+     * The blit only writes inside the visible mode (the centered image ends
+     * at or before row yres), so that is what must fit in the mapping. Do not
+     * use virtual_height here: QEMU sets it to vbe_size / stride, i.e. about
+     * the whole VRAM, so with vgamem_mb > 16 every mode would be rejected.
+     */
+    aperture_needed = (ULONG64)stride * (ULONG64)yres;
     if (aperture_needed > (ULONG64)WIN0DOOM_DISPLAY_BYTES) {
         DbgPrint(
-            "Win0DoomDisplay: DISPI geometry needs %llu bytes, aperture is %lu bytes\n",
+            "Win0DoomDisplay: DISPI visible mode needs %llu bytes, aperture is %lu bytes\n",
             (unsigned long long)aperture_needed,
             WIN0DOOM_DISPLAY_BYTES
         );
@@ -481,6 +487,23 @@ static VOID Win0DoomQueueKeyboardAtDpc(const KEYBOARD_INPUT_DATA *Records, ULONG
     ExReleaseRundownProtection(&g_ControlRundown);
 }
 
+/*
+ * The port driver advances its input queue by *InputDataConsumed
+ * (SystemArgument3) when the class service callback returns. When packets
+ * are not handed to kbdclass (the filter is disconnected or being removed),
+ * report them all as consumed so i8042prt drops them instead of re-offering
+ * them and overflowing its queue, the same contract kbdclass itself keeps.
+ */
+static VOID Win0DoomKeyboardDropPackets(PVOID Start, PVOID End, PVOID Consumed)
+{
+    PKEYBOARD_INPUT_DATA begin = (PKEYBOARD_INPUT_DATA)Start;
+    PKEYBOARD_INPUT_DATA end = (PKEYBOARD_INPUT_DATA)End;
+
+    if (Consumed != NULL) {
+        *(PULONG)Consumed = (begin != NULL && end >= begin) ? (ULONG)(end - begin) : 0;
+    }
+}
+
 static VOID Win0DoomKeyboardServiceCallback(
     PVOID NormalContext,
     PVOID SystemArgument1,
@@ -496,10 +519,12 @@ static VOID Win0DoomKeyboardServiceCallback(
     PKEYBOARD_INPUT_DATA end;
 
     if (filter_device == NULL) {
+        Win0DoomKeyboardDropPackets(SystemArgument1, SystemArgument2, SystemArgument3);
         return;
     }
     extension = (PWIN0DOOM_FILTER_EXTENSION)filter_device->DeviceExtension;
     if (extension == NULL || !ExAcquireRundownProtection(&extension->Rundown)) {
+        Win0DoomKeyboardDropPackets(SystemArgument1, SystemArgument2, SystemArgument3);
         return;
     }
 
@@ -523,7 +548,11 @@ static VOID Win0DoomKeyboardServiceCallback(
                 SystemArgument2,
                 SystemArgument3
             );
+        } else {
+            Win0DoomKeyboardDropPackets(SystemArgument1, SystemArgument2, SystemArgument3);
         }
+    } else {
+        Win0DoomKeyboardDropPackets(SystemArgument1, SystemArgument2, SystemArgument3);
     }
     ExReleaseRundownProtection(&extension->Rundown);
 }
@@ -742,10 +771,11 @@ static NTSTATUS Win0DoomPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     extension = (PWIN0DOOM_FILTER_EXTENSION)DeviceObject->DeviceExtension;
     if (stack->MinorFunction == IRP_MN_SURPRISE_REMOVAL) {
         /*
-         * Stop delivering game input, but keep the device object and the
-         * lower attachment until IRP_MN_REMOVE_DEVICE. Callbacks already in
-         * flight observe Connected == FALSE; the remove path then waits for
-         * them with the rundown before detaching.
+         * Stop delivering input (to the game ring and to kbdclass), but keep
+         * the device object and the lower attachment until
+         * IRP_MN_REMOVE_DEVICE. Callbacks already in flight observe
+         * Connected == FALSE and report their packets as consumed; the remove
+         * path then waits for them with the rundown before detaching.
          */
         Win0DoomFilterSetDisconnected(extension);
         return Win0DoomForwardIrp(DeviceObject, Irp);

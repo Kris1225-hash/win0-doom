@@ -110,6 +110,8 @@ NTSYSAPI NTSTATUS NTAPI ZwWaitForSingleObject(
 #define WIN0DOOM_AUDIO_DMA_LIMIT 0x1000000ULL /* keep below the 16 MiB page limit */
 #define WIN0DOOM_AUDIO_DMA_BOUNDARY 0x10000ULL
 #define WIN0DOOM_AUDIO_DMA_LEAD (WIN0DOOM_AUDIO_DMA_BYTES / 2UL)
+/* Tolerated backward cursor jitter: twice the worst torn count read. */
+#define WIN0DOOM_AUDIO_RESYNC_SLACK 1024UL
 #define WIN0DOOM_AUDIO_CHUNK 1024UL
 #define WIN0DOOM_AUDIO_LOG_MAX 32768UL
 #define WIN0DOOM_AUDIO_LOG_LINE_BYTES 256UL
@@ -118,6 +120,8 @@ NTSYSAPI NTSTATUS NTAPI ZwWaitForSingleObject(
 #define WIN0DOOM_AUDIO_PORT_TIMEOUT 100000UL        /* 1 us stalls */
 
 #define SB16_BASE 0x220
+#define SB16_MIXER_INDEX (SB16_BASE + 0x04)
+#define SB16_MIXER_DATA (SB16_BASE + 0x05)
 #define SB16_DSP_RESET (SB16_BASE + 0x06)
 #define SB16_DSP_READ_DATA (SB16_BASE + 0x0a)
 #define SB16_DSP_WRITE_DATA (SB16_BASE + 0x0c)
@@ -132,6 +136,8 @@ NTSYSAPI NTSTATUS NTAPI ZwWaitForSingleObject(
 #define SB16_DSP_CMD_EXIT_16BIT_AUTO 0xd9
 #define SB16_DSP_CMD_VERSION 0xe1
 #define SB16_DSP_FORMAT_S16_STEREO 0x30
+#define SB16_MIXER_IRQ_SELECT 0x80 /* sb16.c: magic_of_irq(irq), 0x02 = IRQ 5 */
+#define SB16_MIXER_DMA_SELECT 0x81 /* sb16.c: (1 << dma) | (1 << hdma), 0x22 = 1 and 5 */
 
 #define WIN0DOOM_AUDIO_DMA_CHANNEL 5
 #define DMA_MASK_PORT 0xd4
@@ -181,6 +187,13 @@ typedef struct _WIN0DOOM_AUDIO_STATE {
     UCHAR DspResetAck;
     ULONG DspVersion;
 
+    /* What the last start actually programmed and read back, for the log. */
+    ULONG ProgrammedRate;  /* rate sent with 0x41, 0 if that step failed */
+    UCHAR ProgrammedMode;  /* 8237 mode byte written, 0 if not reached */
+    ULONG StartCount;      /* channel-5 count read after 0xB6, ~0 if not reached */
+    UCHAR MixerIrqSelect;  /* SB16 mixer 0x80 */
+    UCHAR MixerDmaSelect;  /* SB16 mixer 0x81 */
+
     HANDLE LogHandle;
     ULONG LogBytes;
     LARGE_INTEGER LogFileOffset;
@@ -190,7 +203,6 @@ static WIN0DOOM_AUDIO_STATE g_Audio;
 
 static NTSTATUS Win0DoomAudioStartDsp(VOID);
 static VOID Win0DoomAudioStopDsp(VOID);
-static ULONG Win0DoomAudioFillAhead(ULONG PlayOffset, ULONG *BufferedAhead);
 static VOID Win0DoomAudioPumpThread(PVOID Context);
 
 /* ------------------------------------------------------------------ */
@@ -348,6 +360,13 @@ static VOID Win0DoomAudioLogInit(VOID)
     Win0DoomAudioLogFlush(&line);
 }
 
+/*
+ * Everything after version= is what this start actually programmed (0 when
+ * the step was not reached) or read back from the hardware: the channel-5
+ * count right after 0xB6 and the SB16 mixer's IRQ/DMA select registers. A
+ * failed start therefore no longer prints the intended rate and mode as if
+ * they had been applied.
+ */
 static VOID Win0DoomAudioLogDspStart(NTSTATUS Status)
 {
     WIN0DOOM_AUDIO_LOG_LINE line;
@@ -358,9 +377,19 @@ static VOID Win0DoomAudioLogDspStart(NTSTATUS Status)
     Win0DoomAudioLogText(&line, " version=0x");
     Win0DoomAudioLogHex(&line, g_Audio.DspVersion, 4);
     Win0DoomAudioLogText(&line, " rate=");
-    Win0DoomAudioLogDecimal(&line, WIN0DOOM_PCM_SAMPLE_RATE);
-    Win0DoomAudioLogText(&line, " dma=0x");
-    Win0DoomAudioLogHex(&line, DMA_MODE_16BIT_AUTO_SINGLE, 2);
+    Win0DoomAudioLogDecimal(&line, g_Audio.ProgrammedRate);
+    Win0DoomAudioLogText(&line, " mode=0x");
+    Win0DoomAudioLogHex(&line, g_Audio.ProgrammedMode, 2);
+    if (g_Audio.StartCount == (ULONG)-1) {
+        Win0DoomAudioLogText(&line, " count0=none");
+    } else {
+        Win0DoomAudioLogText(&line, " count0=0x");
+        Win0DoomAudioLogHex(&line, g_Audio.StartCount, 4);
+    }
+    Win0DoomAudioLogText(&line, " irqsel=0x");
+    Win0DoomAudioLogHex(&line, g_Audio.MixerIrqSelect, 2);
+    Win0DoomAudioLogText(&line, " dmasel=0x");
+    Win0DoomAudioLogHex(&line, g_Audio.MixerDmaSelect, 2);
     Win0DoomAudioLogText(&line, " status=0x");
     Win0DoomAudioLogHex(&line, (ULONG)Status, 8);
     Win0DoomAudioLogFlush(&line);
@@ -397,6 +426,9 @@ static VOID Win0DoomAudioLogRun(VOID)
     Win0DoomAudioLogDecimal(&line, blocks);
     Win0DoomAudioLogText(&line, " silence=");
     Win0DoomAudioLogDecimal(&line, silence);
+    /* Pump-thread state; this runs on the pump thread. */
+    Win0DoomAudioLogText(&line, " resyncs=");
+    Win0DoomAudioLogDecimal(&line, g_Audio.DmaResyncs);
     Win0DoomAudioLogText(&line, " ready=");
     Win0DoomAudioLogDecimal(&line, ready);
     Win0DoomAudioLogFlush(&line);
@@ -469,6 +501,13 @@ static ULONG Win0DoomAudioDspVersion(VOID)
     return ((ULONG)major << 8) | minor;
 }
 
+/* Mixer index at base+4, data at base+5 (sb16.c sb16_ioport_list). */
+static UCHAR Win0DoomAudioMixerRead(UCHAR Index)
+{
+    WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)SB16_MIXER_INDEX, Index);
+    return READ_PORT_UCHAR((PUCHAR)(ULONG_PTR)SB16_MIXER_DATA);
+}
+
 static VOID Win0DoomAudioProgramDma(VOID)
 {
     ULONG64 physical = (ULONG64)g_Audio.DmaPhysical.QuadPart;
@@ -479,6 +518,7 @@ static VOID Win0DoomAudioProgramDma(VOID)
     WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)DMA_MASK_PORT, (UCHAR)(0x04 | (WIN0DOOM_AUDIO_DMA_CHANNEL & 3)));
     WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)DMA_CLEAR_FLIPFLOP_PORT, 0);
     WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)DMA_MODE_PORT, DMA_MODE_16BIT_AUTO_SINGLE);
+    g_Audio.ProgrammedMode = DMA_MODE_16BIT_AUTO_SINGLE;
     WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)DMA_CHANNEL5_ADDRESS_PORT, (UCHAR)(wordAddress & 0xff));
     WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)DMA_CHANNEL5_ADDRESS_PORT, (UCHAR)((wordAddress >> 8) & 0xff));
     WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)DMA_CHANNEL5_COUNT_PORT, (UCHAR)(count & 0xff));
@@ -495,7 +535,7 @@ static VOID Win0DoomAudioProgramDma(VOID)
  * assembled 16-bit value is val >> 1: a WORD count, 16383 - fetched_bytes/2.
  * Clear the byte-pointer flip-flop first so the two reads are low then high.
  */
-static ULONG Win0DoomAudioReadDmaCount(VOID)
+static ULONG Win0DoomAudioReadDmaCountOnce(VOID)
 {
     UCHAR low;
     UCHAR high;
@@ -506,12 +546,42 @@ static ULONG Win0DoomAudioReadDmaCount(VOID)
     return ((ULONG)high << 8) | (ULONG)low;
 }
 
+/*
+ * The low and high bytes are two separate port reads, and qemu's DMA engine
+ * (an i8257 bottom half on the main loop) can advance between them: a borrow
+ * out of the low byte then assembles a count up to 255 words too low, a
+ * cursor ~0.5 KiB ahead of the truth. The engine moves in bursts, so repeat
+ * the pair until two consecutive values agree (bounded; the last value is
+ * used if the controller never settles).
+ */
+static ULONG Win0DoomAudioReadDmaCount(VOID)
+{
+    ULONG previous = Win0DoomAudioReadDmaCountOnce();
+    ULONG attempt;
+
+    for (attempt = 0; attempt < 4; ++attempt) {
+        ULONG current = Win0DoomAudioReadDmaCountOnce();
+
+        if (current == previous) {
+            return current;
+        }
+        previous = current;
+    }
+    return previous;
+}
+
 static NTSTATUS Win0DoomAudioStartDsp(VOID)
 {
     NTSTATUS status;
     ULONG count;
 
     g_Audio.DspVersion = 0;
+    g_Audio.ProgrammedRate = 0;
+    g_Audio.ProgrammedMode = 0;
+    g_Audio.StartCount = (ULONG)-1;
+    /* Read before the reset so an absent card is visible as 0xff here. */
+    g_Audio.MixerIrqSelect = Win0DoomAudioMixerRead(SB16_MIXER_IRQ_SELECT);
+    g_Audio.MixerDmaSelect = Win0DoomAudioMixerRead(SB16_MIXER_DMA_SELECT);
     status = Win0DoomAudioResetDsp();
     if (!NT_SUCCESS(status)) {
         return status;
@@ -527,6 +597,7 @@ static NTSTATUS Win0DoomAudioStartDsp(VOID)
         !Win0DoomAudioDspWrite(0x11)) {
         return STATUS_IO_TIMEOUT;
     }
+    g_Audio.ProgrammedRate = WIN0DOOM_PCM_SAMPLE_RATE;
 
     Win0DoomAudioProgramDma();
     count = g_Audio.DmaBytes / 2UL - 1UL;
@@ -547,6 +618,7 @@ static NTSTATUS Win0DoomAudioStartDsp(VOID)
      * or a floating bus and is not usable as an anchor.
      */
     g_Audio.DmaAnchorCount = Win0DoomAudioReadDmaCount();
+    g_Audio.StartCount = g_Audio.DmaAnchorCount;
     if (g_Audio.DmaAnchorCount <= g_Audio.DmaBytes / 2UL - 1UL) {
         g_Audio.DmaAnchorPosition =
             (g_Audio.DmaBytes - 2UL - g_Audio.DmaAnchorCount * 2UL) &
@@ -667,37 +739,6 @@ static VOID Win0DoomAudioFillSilence(ULONG Offset, ULONG Length)
     }
 }
 
-/*
- * Fill the DMA buffer from PlayOffset + *BufferedAhead up to one lead
- * (half a buffer) ahead, taking PCM from the ring and counting the bytes
- * that had to be replaced with silence.  The caller owns the position
- * bookkeeping; this runs only on the pump thread.
- */
-static ULONG Win0DoomAudioFillAhead(ULONG PlayOffset, ULONG *BufferedAhead)
-{
-    ULONG offset = (PlayOffset + *BufferedAhead) & (g_Audio.DmaBytes - 1);
-    ULONG silence = 0;
-
-    while (*BufferedAhead < WIN0DOOM_AUDIO_DMA_LEAD) {
-        UCHAR chunk[WIN0DOOM_AUDIO_CHUNK];
-        ULONG want = WIN0DOOM_AUDIO_DMA_LEAD - *BufferedAhead;
-        ULONG got;
-
-        if (want > WIN0DOOM_AUDIO_CHUNK) {
-            want = WIN0DOOM_AUDIO_CHUNK;
-        }
-        got = Win0DoomAudioRingRead(chunk, want);
-        Win0DoomAudioCopyToDma(offset, chunk, got);
-        if (got < want) {
-            Win0DoomAudioFillSilence((offset + got) & (g_Audio.DmaBytes - 1), want - got);
-            silence += want - got;
-        }
-        offset = (offset + want) & (g_Audio.DmaBytes - 1);
-        *BufferedAhead += want;
-    }
-    return silence;
-}
-
 static ULONG64 Win0DoomAudioTicksToBytes(ULONG64 Ticks, ULONG64 Frequency)
 {
     ULONG64 seconds;
@@ -726,7 +767,6 @@ static VOID Win0DoomAudioPumpThread(PVOID Context)
     ULONG64 playedRun = 0;
     ULONG64 playedBase = 0;
     ULONG primeSilence = 0;
-    ULONG primed = 0;
     BOOLEAN running;
     NTSTATUS status;
     KIRQL irql;
@@ -735,9 +775,15 @@ static VOID Win0DoomAudioPumpThread(PVOID Context)
 
     Win0DoomAudioLogInit();
 
+    /*
+     * Prime the first lead with silence only and leave the ring alone. PCM
+     * queued around a (re)start then plays contiguously from FillOffset
+     * (= LEAD) instead of being split by the silence the prime used to pad
+     * it with: a first self-test block that won the race with the
+     * CREATE-triggered restart was followed by ~325 ms of silence.
+     */
     RtlZeroMemory(g_Audio.DmaBuffer, g_Audio.DmaBytes);
-    primed = 0;
-    primeSilence = Win0DoomAudioFillAhead(0, &primed);
+    primeSilence = WIN0DOOM_AUDIO_DMA_LEAD;
     status = Win0DoomAudioStartDsp();
     running = NT_SUCCESS(status);
     startTime = KeQueryPerformanceCounter(&frequency);
@@ -761,9 +807,8 @@ static VOID Win0DoomAudioPumpThread(PVOID Context)
                 playedBase += playedRun;
             }
             playedRun = 0;
-            primed = 0;
             RtlZeroMemory(g_Audio.DmaBuffer, g_Audio.DmaBytes);
-            primeSilence = Win0DoomAudioFillAhead(0, &primed);
+            primeSilence = WIN0DOOM_AUDIO_DMA_LEAD; /* silence only, see above */
             status = Win0DoomAudioStartDsp();
             running = NT_SUCCESS(status);
             startTime = KeQueryPerformanceCounter(&frequency);
@@ -821,22 +866,34 @@ static VOID Win0DoomAudioPumpThread(PVOID Context)
              * fillOffset is an absolute buffer cursor that advances only
              * with the bytes taken from the ring, so the stream stays
              * byte-locked to the playhead.  Keep it between pos and one
-             * lead ahead; if it fell behind (a big fetch burst or a
-             * restart), re-lock it one lead ahead and count the skip.
+             * lead ahead.  Every fill ends exactly one lead ahead, so a
+             * cursor read that lands slightly behind the previous one shows
+             * up just above LEAD: the queued PCM is still ahead of the real
+             * cursor, so write nothing this pass instead of rewinding over
+             * it.  Beyond that slack the fill cursor really fell behind, or
+             * less than half a lead is left: re-lock one lead ahead and
+             * silence the skipped window, which otherwise still holds PCM
+             * from the previous lap of the buffer (~743 ms old) and would
+             * play again.
              */
             ahead = (g_Audio.FillOffset - position) & (g_Audio.DmaBytes - 1);
-            if (ahead > g_Audio.DmaBytes - WIN0DOOM_AUDIO_DMA_LEAD) {
-                /* Fill pointer fell behind (or absurdly ahead of) the playhead. */
-                g_Audio.FillOffset = (position + WIN0DOOM_AUDIO_DMA_LEAD) &
-                    (g_Audio.DmaBytes - 1);
-                g_Audio.DmaResyncs++;
+            if (ahead > WIN0DOOM_AUDIO_DMA_LEAD &&
+                ahead <= WIN0DOOM_AUDIO_DMA_LEAD + WIN0DOOM_AUDIO_RESYNC_SLACK) {
                 ahead = WIN0DOOM_AUDIO_DMA_LEAD;
-            } else if (ahead < WIN0DOOM_AUDIO_DMA_LEAD / 2) {
-                /*
-                 * A fetch burst consumed more than half the lead between two
-                 * samples; never write within LEAD/2 of the live cursor.
-                 * Skip this window and re-lock one full lead ahead.
-                 */
+            } else if (ahead > g_Audio.DmaBytes - WIN0DOOM_AUDIO_DMA_LEAD ||
+                       ahead < WIN0DOOM_AUDIO_DMA_LEAD / 2) {
+                ULONG skipped;
+
+                if (ahead > g_Audio.DmaBytes - WIN0DOOM_AUDIO_DMA_LEAD) {
+                    /* Fell behind: everything from the cursor on is stale. */
+                    skipped = WIN0DOOM_AUDIO_DMA_LEAD;
+                    Win0DoomAudioFillSilence(position, skipped);
+                } else {
+                    /* Short: keep what is queued, silence the rest. */
+                    skipped = WIN0DOOM_AUDIO_DMA_LEAD - ahead;
+                    Win0DoomAudioFillSilence(g_Audio.FillOffset, skipped);
+                }
+                silence += skipped;
                 g_Audio.FillOffset = (position + WIN0DOOM_AUDIO_DMA_LEAD) &
                     (g_Audio.DmaBytes - 1);
                 g_Audio.DmaResyncs++;

@@ -33,6 +33,7 @@ import argparse
 import json
 import math
 import os
+import re
 import struct
 import sys
 
@@ -707,6 +708,25 @@ def draw_overview(waveform_path, spectrogram_path, out_path, title, metrics):
 # ---------------------------------------------------------------------------
 # main
 
+# Everything this tool writes into --out-dir.  A rerun into the same directory
+# must not leave the previous run's images or slices beside the new report
+# (for example an "audio-present" overview next to a "no-audio-file"
+# report.json).  Only these names are removed; other files are left alone.
+OUTPUT_FILES = ("report.json", "waveform.png", "spectrogram.png", "overview.png")
+SLICE_NAME = re.compile(r"window-\d{3}\.wav")
+
+
+def clear_previous_outputs(out_dir):
+    for name in OUTPUT_FILES:
+        path = os.path.join(out_dir, name)
+        if os.path.isfile(path):
+            os.remove(path)
+    slices_dir = os.path.join(out_dir, "slices")
+    if os.path.isdir(slices_dir):
+        for name in os.listdir(slices_dir):
+            if SLICE_NAME.fullmatch(name):
+                os.remove(os.path.join(slices_dir, name))
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -719,6 +739,7 @@ def main():
     wav_path = os.path.abspath(args.wav)
     out_dir = os.path.abspath(args.out_dir)
     os.makedirs(out_dir, exist_ok=True)
+    clear_previous_outputs(out_dir)
     if not os.path.isfile(wav_path):
         if os.path.basename(wav_path) == "capture.wav":
             # qemu's wav audiodev only creates the file when the guest first

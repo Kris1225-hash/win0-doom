@@ -75,6 +75,7 @@ $null = New-Item -ItemType Directory -Force -Path $NativeBuild, $DriverBuild
 $DoomObject = Join-Path $NativeBuild 'win0-doom.obj'
 $DoomExe = Join-Path $NativeBuild 'win0doom.exe'
 $DriverObject = Join-Path $DriverBuild 'win0doom-display.obj'
+$AudioObject = Join-Path $DriverBuild 'win0doom-audio.obj'
 $UnsignedDriver = Join-Path $DriverBuild 'win0doom-display.sys'
 $SignedDriver = Join-Path $DriverBuild 'win0doom-display-signed.sys'
 $NtdllCandidates = @(
@@ -113,19 +114,26 @@ Invoke-Native $LldLink @(
     $NtdllLib
 )
 
-$DriverCompileArguments = @(
+$DriverCompileFlags = @(
     '/c', '/nologo', '/kernel', '/GS-', '/GR-', '/Zl', '/W4',
     $CommonWarnings[0], $CommonWarnings[1], $CommonWarnings[2], $CommonWarnings[3],
     $CommonDefines[0], $CommonDefines[1], '/D_KERNEL_MODE',
     "/I$(Join-Path $SdkRoot "Include\$SdkVersion\km\crt")",
     "/I$(Join-Path $SdkRoot "Include\$SdkVersion\shared")",
-    "/I$(Join-Path $SdkRoot "Include\$SdkVersion\km")",
-    "/Fo$DriverObject", (Join-Path $DriverDir 'win0doom-display.c')
+    "/I$(Join-Path $SdkRoot "Include\$SdkVersion\km")"
 )
-Invoke-Native $ClangCl $DriverCompileArguments
+# win0doom-display.c calls the Win0DoomAudio* entry points, so the audio
+# object is compiled and linked into the same image (as driver/build-driver.sh
+# does on Linux).
+Invoke-Native $ClangCl ($DriverCompileFlags + @(
+    "/Fo$DriverObject", (Join-Path $DriverDir 'win0doom-display.c')
+))
+Invoke-Native $ClangCl ($DriverCompileFlags + @(
+    "/Fo$AudioObject", (Join-Path $DriverDir 'win0doom-audio.c')
+))
 Invoke-Native $LldLink @(
     '/nologo', '/driver', '/release', '/machine:x64', '/subsystem:native',
-    '/entry:DriverEntry', '/nodefaultlib', "/out:$UnsignedDriver", $DriverObject,
+    '/entry:DriverEntry', '/nodefaultlib', "/out:$UnsignedDriver", $DriverObject, $AudioObject,
     (Join-Path $SdkRoot "Lib\$SdkVersion\km\x64\ntoskrnl.lib"),
     (Join-Path $SdkRoot "Lib\$SdkVersion\km\x64\hal.lib")
 )

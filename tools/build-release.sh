@@ -30,7 +30,9 @@
 #   WIN0DOOM_SIGN_PASSWORD      pfx password (default: empty)
 #   WIN0DOOM_SIGN_NAME          signature description text
 #                               (default: "Win0 Doom display and keyboard bridge")
-#   LLVM_BIN                    directory holding clang-cl/lld-link/llvm-readobj
+#   LLVM_BIN                    directory holding clang-cl/lld-link/llvm-readobj/llvm-nm;
+#                               passed to the build scripts as well, so one
+#                               toolchain both builds and inspects the release
 #                               (default: /usr/lib/llvm/22/bin)
 #
 # The WDK OEM test root certificate has no CA basic-constraints extension, so
@@ -38,9 +40,12 @@
 # chain even though Windows test signing accepts it.  The verification below
 # requires the Authenticode digest to match the file, the PE checksum to cover
 # the signed overlay, an independent PKCS#7 signature check with `openssl
-# smime -verify -noverify` (OpenSSL's PKCS7_verify aborts at the chain before
-# touching the RSA signature), and the signer to be the certificate from the
-# pfx; a chain failure is tolerated only when OpenSSL fails for that specific
+# smime -verify -noverify -content` (OpenSSL's PKCS7_verify aborts at the
+# chain before touching the RSA signature; the signed SpcIndirectDataContent
+# body is passed explicitly so OpenSSL 3.0-3.4 digest the same bytes as 3.5+),
+# and the certificate that produced that signature to be byte-for-byte the
+# pfx's end-entity certificate (sha256 of its DER, not a CN string); a chain
+# failure is tolerated only when OpenSSL fails for that specific
 # trust-anchor reason and nothing else.  Any other error, a digest or
 # checksum mismatch, a missing signature, or a different signer fails the
 # build.  The pfx is a local build input that ships with the extracted SDK:
@@ -150,16 +155,44 @@ case "$intermediate" in
     *) cross_pem="$work_dir/intermediate.pem"; to_pem "$intermediate" >"$cross_pem" ;;
 esac
 
+# The pfx's end-entity certificate as PEM.  OpenSSL 3 refuses the RC2-40
+# encryption many Windows pfx exports use unless -legacy is given (and
+# OpenSSL 1.1 has no -legacy flag), so try both; each attempt is captured
+# separately so a partial first attempt never doubles the output.
+pfx_leaf_pem() {
+    local out=''
+    if out="$(openssl pkcs12 -in "$pfx" -clcerts -nokeys -passin "pass:$password" 2>/dev/null)" &&
+        [[ -n "$out" ]]; then
+        printf '%s\n' "$out"
+        return 0
+    fi
+    out="$(openssl pkcs12 -legacy -in "$pfx" -clcerts -nokeys -passin "pass:$password" 2>/dev/null)" ||
+        return 1
+    [[ -n "$out" ]] || return 1
+    printf '%s\n' "$out"
+}
+
+# Compare names by OpenSSL's canonical name hash, not by parsing display
+# text: OpenSSL 1.1+ prints `CN = name` (spaces around '='), which the old
+# `sed 's/.*CN=\(.*\)/\1/p'` never matched, so this check failed every build.
+# The hash also covers the whole distinguished name, not just its CN.
+expected_leaf_sha256=''
 if command -v openssl >/dev/null; then
-    leaf_issuer_cn="$(openssl pkcs12 -in "$pfx" -nokeys -passin "pass:$password" -nodes 2>/dev/null |
-        openssl x509 -noout -issuer 2>/dev/null |
-        sed -n 's/.*CN=\(.*\)/\1/p')"
-    cross_cn="$(openssl x509 -in "$cross_pem" -noout -subject 2>/dev/null |
-        sed -n 's/.*CN=\(.*\)/\1/p')"
-    [[ -n "$leaf_issuer_cn" && -n "$cross_cn" ]] ||
+    leaf_pem="$(pfx_leaf_pem)" ||
+        fail "cannot read the signing certificate from $pfx (wrong WIN0DOOM_SIGN_PASSWORD, or OpenSSL 3 without its legacy provider for an RC2-encrypted pfx)"
+    leaf_issuer_hash="$(printf '%s\n' "$leaf_pem" | openssl x509 -noout -issuer_hash 2>/dev/null)" ||
+        leaf_issuer_hash=''
+    cross_subject_hash="$(openssl x509 -in "$cross_pem" -noout -subject_hash 2>/dev/null)" ||
+        cross_subject_hash=''
+    [[ -n "$leaf_issuer_hash" && -n "$cross_subject_hash" ]] ||
         fail "cannot read the $pfx issuer or the cross certificate subject"
-    [[ "$leaf_issuer_cn" == "$cross_cn" ]] ||
-        fail "cross certificate CN=\"$cross_cn\" does not issue the signing certificate (issuer CN=\"$leaf_issuer_cn\")"
+    [[ "$leaf_issuer_hash" == "$cross_subject_hash" ]] ||
+        fail "the cross certificate ($(openssl x509 -in "$cross_pem" -noout -subject 2>/dev/null)) does not issue the signing certificate ($(printf '%s\n' "$leaf_pem" | openssl x509 -noout -issuer 2>/dev/null))"
+    # The signer pin for verify_signature: sha256 of the leaf's DER encoding.
+    expected_leaf_sha256="$(printf '%s\n' "$leaf_pem" | openssl x509 -outform DER 2>/dev/null |
+        sha256sum | awk '{ print $1 }')" || expected_leaf_sha256=''
+    [[ "$expected_leaf_sha256" =~ ^[0-9a-f]{64}$ ]] ||
+        fail "cannot fingerprint the signing certificate in $pfx"
 fi
 
 # Assemble the WDK OEM 2017 root + intermediate as a trust bundle.  The chain
@@ -191,9 +224,9 @@ say "build-release: intermediate=$intermediate"
 
 say ''
 say '== build =='
-WINDOWS_SDK_ROOT="$sdk_root" "$repo_dir/native/build-win0-doom.sh"
-WINDOWS_SDK_ROOT="$sdk_root" "$repo_dir/native/build-input-probe.sh"
-WINDOWS_SDK_ROOT="$sdk_root" "$repo_dir/driver/build-driver.sh"
+WINDOWS_SDK_ROOT="$sdk_root" LLVM_BIN="$llvm_bin" "$repo_dir/native/build-win0-doom.sh"
+WINDOWS_SDK_ROOT="$sdk_root" LLVM_BIN="$llvm_bin" "$repo_dir/native/build-input-probe.sh"
+WINDOWS_SDK_ROOT="$sdk_root" LLVM_BIN="$llvm_bin" "$repo_dir/driver/build-driver.sh"
 
 say ''
 say '== sign =='
@@ -234,10 +267,30 @@ pe_imports() {
 # signature verification
 # ---------------------------------------------------------------------------
 
+# Authenticode signs the body of SpcIndirectDataContent (content type
+# 1.3.6.1.4.1.311.2.1.4): the SEQUENCE contents without their tag and length.
+# OpenSSL 3.5+ extracts that body itself, but earlier releases hash an empty
+# body for any content type other than "data", so `openssl smime -verify`
+# reports "digest failure" for every valid Authenticode signature on
+# OpenSSL 3.0-3.4.  Cut the body out of the DER blob and pass it with
+# -content; every OpenSSL 3 release then digests the same bytes.
+authenticode_content() {
+    local blob="$1" out="$2" offset='' header='' length=''
+    read -r offset header length < <(
+        openssl asn1parse -inform DER -in "$blob" 2>/dev/null |
+            sed -n '/:1\.3\.6\.1\.4\.1\.311\.2\.1\.4 *$/,$p' |
+            sed -n '/cons: SEQUENCE/{s/^ *\([0-9]*\):d= *[0-9]* *hl=\([0-9]*\) *l= *\([0-9]*\) .*/\1 \2 \3/p;q;}'
+    ) || true
+    [[ "$offset" =~ ^[0-9]+$ && "$header" =~ ^[0-9]+$ && "$length" =~ ^[0-9]+$ ]] ||
+        return 1
+    tail -c "+$((offset + header + 1))" -- "$blob" | head -c "$length" >"$out"
+    [[ "$(file_size "$out")" == "$length" ]]
+}
+
 signature_status='unverified'
 verify_signature() {
     local log="$work_dir/osslsigncode-verify.log"
-    local rc=0 args current calculated signer_subject signer_cn expected_cn unexpected
+    local rc=0 args current calculated signer_pem signer_sha256 signer_name unexpected
 
     args=(verify -in "$signed_driver")
     if [[ -n "$trust_pem" ]]; then
@@ -271,34 +324,36 @@ verify_signature() {
     # verification before it ever checks the RSA signature.  A corrupt
     # signature must not hide behind the tolerated chain error, so verify the
     # extracted PKCS#7 signature separately (signature over the signed
-    # attributes and their message digest, chain ignored).
+    # attributes and their message digest, chain ignored).  The signed
+    # content is passed explicitly: see authenticode_content().
     signature_blob="$work_dir/signature.p7"
+    signed_content="$work_dir/signature.content"
     "$signer" extract-signature -in "$signed_driver" -out "$signature_blob" >/dev/null 2>&1 ||
         fail "cannot extract the Authenticode signature from $signed_driver"
     command -v openssl >/dev/null ||
         fail 'openssl is required to verify the Authenticode signature independently'
-    if ! openssl smime -verify -inform DER -in "$signature_blob" -noverify -out /dev/null >/dev/null 2>&1; then
+    authenticode_content "$signature_blob" "$signed_content" ||
+        fail "cannot find SpcIndirectDataContent in the Authenticode signature of $signed_driver"
+    signer_pem="$work_dir/signer.pem"
+    if ! openssl smime -verify -inform DER -in "$signature_blob" -noverify \
+            -content "$signed_content" -signer "$signer_pem" -out /dev/null >/dev/null 2>&1; then
         fail "the Authenticode signature does not verify against the signed attributes in $signed_driver"
     fi
 
-    signer_subject="$(awk '/Signer #0:/ { seen = 1 } seen && /Subject:/ {
-        sub(/^.*Subject: */, ""); print; exit }' "$log")"
-    [[ -n "$signer_subject" ]] || fail 'could not read the signer certificate subject'
-    signer_cn="$(printf '%s\n' "$signer_subject" | sed -n 's/.*CN=\(.*\)/\1/p')"
-    [[ -n "$signer_cn" ]] || fail "could not read CN from the signer subject: $signer_subject"
-
-    if command -v openssl >/dev/null; then
-        expected_cn="$(openssl pkcs12 -in "$pfx" -nokeys -passin "pass:$password" -nodes 2>/dev/null |
-            openssl x509 -noout -subject 2>/dev/null |
-            sed -n 's/.*CN=\(.*\)/\1/p')"
-        if [[ -n "$expected_cn" ]]; then
-            [[ "$signer_cn" == "$expected_cn" ]] ||
-                fail "signed by CN=\"$signer_cn\", expected CN=\"$expected_cn\""
-        fi
-    fi
+    # Pin the signer: -signer wrote the certificate that produced the
+    # signature just verified, and it must be byte-for-byte the pfx's leaf.
+    # A CN string compare proved nothing (any CA can issue that CN).
+    [[ -n "$expected_leaf_sha256" ]] ||
+        fail 'openssl is required to pin the signing certificate'
+    signer_sha256="$(openssl x509 -in "$signer_pem" -outform DER 2>/dev/null |
+        sha256sum | awk '{ print $1 }')" || signer_sha256=''
+    signer_name="$(openssl x509 -in "$signer_pem" -noout -subject 2>/dev/null)" || signer_name=''
+    signer_name="${signer_name#subject=}"
+    [[ "$signer_sha256" == "$expected_leaf_sha256" ]] ||
+        fail "signed by \"${signer_name:-unknown}\" (certificate sha256 ${signer_sha256:-unreadable}), not the $pfx certificate (sha256 $expected_leaf_sha256)"
 
     if (( rc == 0 )); then
-        signature_status="ok (sha256 digest, PKCS#7 signature and chain verified; signer CN \"$signer_cn\")"
+        signature_status="ok (sha256 digest, PKCS#7 signature and chain verified; signer \"${signer_name# }\" pinned to the pfx certificate)"
         return 0
     fi
 
@@ -318,7 +373,7 @@ verify_signature() {
         fail 'osslsigncode verify reported unexpected errors'
     fi
 
-    signature_status="ok (sha256 digest and PKCS#7 signature verified; signer CN \"$signer_cn\"; WDK test chain trusted by Windows only)"
+    signature_status="ok (sha256 digest and PKCS#7 signature verified; signer \"${signer_name# }\" pinned to the pfx certificate; WDK test chain trusted by Windows only)"
 }
 
 # ---------------------------------------------------------------------------
