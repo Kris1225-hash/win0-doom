@@ -847,6 +847,13 @@ static doom_key_t scan_code_to_doom(USHORT make_code, USHORT flags)
     case 0x41: return DOOM_KEY_F7;
     case 0x42: return DOOM_KEY_F8;
     case 0x43: return DOOM_KEY_F9;
+    /* F10-F12 are non-extended in scan code set 1 (0x44/0x57/0x58),
+     * continuing the F1-F9 table directly. PureDOOM binds F10 to Quit
+     * DOOM and F11 to the gamma toggle; F10 is the only clean exit
+     * from the client's game loop. */
+    case 0x44: return DOOM_KEY_F10;
+    case 0x57: return DOOM_KEY_F11;
+    case 0x58: return DOOM_KEY_F12;
     default: return DOOM_KEY_UNKNOWN;
     }
 }
