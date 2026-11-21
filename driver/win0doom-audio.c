@@ -7,8 +7,12 @@
  * 16-bit DMA channel 5 and IRQ 5.  This driver never installs an interrupt
  * handler: the SB16's 16-bit auto-init DMA loops over one physically
  * contiguous buffer by itself, and a PASSIVE_LEVEL pump thread refills the
- * region ahead of the playback cursor based on KeQueryPerformanceCounter
- * time and the known 44100 bytes/second.  QEMU raises the ISA IRQ at every
+ * region ahead of the playback cursor anchored to the real 8237 channel-5
+ * count register (words remaining; see Win0DoomAudioReadDmaCount below).
+ * The earlier KeQueryPerformanceCounter estimate is kept only as a fallback
+ * for ticks where the count read is unusable: a time-based estimate drifted
+ * by a non-4-byte amount and rotated the 16-bit samples (NEXT.md, failed
+ * paths).  QEMU raises the ISA IRQ at every
  * block boundary even in auto-init (sb16.c:1257-1259); with no ISR
  * installed the pump thread simply reads the 16-bit acknowledge port 0x22F
  * (sb16.c:1044-1049) so the line is deasserted.
