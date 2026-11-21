@@ -188,6 +188,7 @@ typedef struct _WIN0DOOM_AUDIO_STATE {
     HANDLE LogHandle;
     ULONG LogBytes;
     LARGE_INTEGER LogFileOffset;
+    BOOLEAN LogInitPending;
 } WIN0DOOM_AUDIO_STATE;
 
 static WIN0DOOM_AUDIO_STATE g_Audio;
@@ -196,6 +197,7 @@ static NTSTATUS Win0DoomAudioStartDsp(VOID);
 static VOID Win0DoomAudioStopDsp(VOID);
 static ULONG Win0DoomAudioFillAhead(ULONG PlayOffset, ULONG *BufferedAhead);
 static VOID Win0DoomAudioPumpThread(PVOID Context);
+static VOID Win0DoomAudioLogInit(VOID);
 
 /* ------------------------------------------------------------------ */
 /* Diagnostic log (pump thread only, PASSIVE_LEVEL only)               */
@@ -259,6 +261,21 @@ static VOID Win0DoomAudioLogAppend(PVOID Data, ULONG Length)
                 g_Audio.LogFileOffset = information.EndOfFile;
             } else {
                 g_Audio.LogFileOffset.QuadPart = 0;
+            }
+        }
+        if (g_Audio.LogInitPending) {
+            /*
+             * A boot-start driver's first log attempt can run before the
+             * system volume is openable, and that attempt's line would then
+             * be lost forever while later lines succeed.  Emit the deferred
+             * init line now, ahead of the line that triggered this open.
+             * LogHandle is already set and the flag is cleared, so the
+             * nested append writes directly without recursing.
+             */
+            g_Audio.LogInitPending = FALSE;
+            Win0DoomAudioLogInit();
+            if (g_Audio.LogHandle == NULL) {
+                return; /* the nested write failed and closed the handle */
             }
         }
     }
@@ -737,7 +754,12 @@ static VOID Win0DoomAudioPumpThread(PVOID Context)
 
     UNREFERENCED_PARAMETER(Context);
 
-    Win0DoomAudioLogInit();
+    /*
+     * Do not try to write the init line here: at boot-start the system
+     * volume may not be openable yet.  LogAppend emits it on the first
+     * successful open instead.
+     */
+    g_Audio.LogInitPending = TRUE;
 
     RtlZeroMemory(g_Audio.DmaBuffer, g_Audio.DmaBytes);
     primed = 0;
