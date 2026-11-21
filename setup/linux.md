@@ -23,8 +23,8 @@ qemu-system-x86_64 -name windows-11-two-disk-validationos \
  -drive if=none,id=validationos_disk,format=qcow2,cache=writeback,discard=unmap,file=/mnt/Data/VMs/windows-11-two-disk/validationos-playable-run.qcow2 \
  -device ide-hd,drive=validationos_disk,bus=ide.1,bootindex=1 \
  -boot menu=on,strict=on -device qemu-xhci -device usb-tablet \
- -device ich9-intel-hda -device hda-duplex,audiodev=desktop_audio \
- -audiodev pipewire,id=desktop_audio \
+ -device sb16,audiodev=snd0 \
+ -audiodev wav,id=snd0,path=/tmp/win0-audio-capture.wav \
  -nic user,model=e1000e,hostfwd=tcp:127.0.0.1:33890-:3389 \
 -vga std -display gtk,gl=on -rtc base=localtime,clock=host,driftfix=slew \
  -global ICH9-LPC.disable_s3=1
@@ -32,6 +32,14 @@ qemu-system-x86_64 -name windows-11-two-disk-validationos \
 
 (s3 sleep is disabled because nothing at runlevel 0 would ever resume it
 gracefully.)
+
+the launch above records the guest's SB16 output to
+`/tmp/win0-audio-capture.wav` while the display stays on the gtk window.
+`tools/audio-capture.sh` wraps the same setup headless (OVMF, `-vga std`,
+`-display none`, a monitor socket, screendumps, the slow `sendkey` scenario,
+clean HMP `quit`), and `tools/audio-report.py` produces the verdict, waveform,
+spectrogram and WAV slices. qemu does not finalize the RIFF/data sizes on
+exit; the analyzer derives the length from the file size.
 
 before booting, make the run disk disposable:
 
