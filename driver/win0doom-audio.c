@@ -270,6 +270,9 @@ static VOID Win0DoomAudioLogAppend(PVOID Data, ULONG Length)
              */
             g_Audio.LogInitPending = FALSE;
             Win0DoomAudioLogInit();
+            if (g_Audio.LogHandle == NULL) {
+                return; /* the nested write failed and closed the handle */
+            }
         }
     }
     if (Length > WIN0DOOM_AUDIO_LOG_MAX - g_Audio.LogBytes) {
