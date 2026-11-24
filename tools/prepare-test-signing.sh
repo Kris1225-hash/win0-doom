@@ -83,11 +83,16 @@ done
 
 ovmf_code=""
 ovmf_vars=""
-for candidate in /usr/share/edk2/OvmfX64/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd; do
-    [[ -f "$candidate" ]] && ovmf_code="$candidate" && break
-done
-for candidate in /usr/share/edk2/OvmfX64/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd; do
-    [[ -f "$candidate" ]] && ovmf_vars="$candidate" && break
+# CODE and VARS must come from the same build (2 MiB and 4 MiB images do not mix).
+for pair in \
+    /usr/share/edk2/OvmfX64/OVMF_CODE.fd:/usr/share/edk2/OvmfX64/OVMF_VARS.fd \
+    /usr/share/OVMF/OVMF_CODE.fd:/usr/share/OVMF/OVMF_VARS.fd \
+    /usr/share/OVMF/OVMF_CODE_4M.fd:/usr/share/OVMF/OVMF_VARS_4M.fd; do
+    if [[ -f "${pair%%:*}" && -f "${pair##*:}" ]]; then
+        ovmf_code="${pair%%:*}"
+        ovmf_vars="${pair##*:}"
+        break
+    fi
 done
 if [[ -z "$ovmf_code" || -z "$ovmf_vars" ]]; then
     printf 'could not find OVMF_CODE.fd and OVMF_VARS.fd.\n' >&2
