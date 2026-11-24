@@ -119,10 +119,26 @@ typedef struct _WIN0DOOM_FILTER_EXTENSION {
     BOOLEAN Connected;
     BOOLEAN Disconnected;
     BOOLEAN RundownWaited;
+    PIO_WORKITEM ClassOpenWorkItem;   /* opens the class device above us once */
+    KEVENT ClassOpenIdle;             /* signaled whenever the work item is not running */
+    volatile LONG ClassOpenQueued;
+    volatile LONG ClassOpenCancel;
+    HANDLE ClassHandle;               /* kernel handle that keeps the port enabled */
 } WIN0DOOM_FILTER_EXTENSION, *PWIN0DOOM_FILTER_EXTENSION;
 
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_ADD_DEVICE Win0DoomAddDevice;
+
+/* Exported by ntoskrnl.exe; declared in ntifs.h, which ntddk.h does not include. */
+NTKERNELAPI NTSTATUS ObQueryNameString(
+    PVOID Object,
+    POBJECT_NAME_INFORMATION ObjectNameInfo,
+    ULONG Length,
+    PULONG ReturnLength
+);
+
+#define WIN0DOOM_CLASS_OPEN_ATTEMPTS 100UL
+#define WIN0DOOM_CLASS_OPEN_RETRY_100NS (-1000000LL) /* 100 ms */
 
 static PWIN0DOOM_CONTROL_EXTENSION g_ControlExtension;
 static EX_RUNDOWN_REF g_ControlRundown;
@@ -662,6 +678,138 @@ static NTSTATUS Win0DoomDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     return Win0DoomCompleteIrp(Irp, STATUS_SUCCESS, 0);
 }
 
+/*
+ * i8042prt only queues keyboard input while a handle to the keyboard stack is
+ * open: kbdclass forwards IRP_MJ_CREATE/IRP_MJ_CLOSE to the port, which keeps
+ * an enable count. ccs holds such a handle while it sits at its interactive
+ * prompt, but when the session manager's CcsCommand value makes ccs launch
+ * win0doom.exe directly, nobody opens the keyboard. The port then drops every
+ * scan code, the service callback below never runs, and doom renders with no
+ * input. Measured in a CcsCommand image: the filter attached and connected,
+ * IRQ 1 fired for every key, yet zero service callbacks; the same image with
+ * CcsCommand removed delivered every key typed at the ccs prompt. Sending
+ * IOCTL_INTERNAL_KEYBOARD_ENABLE instead is not an option: i8042prt fails it
+ * with STATUS_INVALID_DEVICE_REQUEST.
+ *
+ * So after the class driver connects, open the class device attached above
+ * this filter and keep that handle for the life of the stack. The handle is
+ * never read from, so it does not compete with ccs for input; it only keeps
+ * the port's enable count non-zero. It is closed on removal and unload.
+ */
+static NTSTATUS Win0DoomOpenClassAbove(PDEVICE_OBJECT FilterDevice, PHANDLE Handle)
+{
+    PDEVICE_OBJECT top;
+    POBJECT_NAME_INFORMATION name = NULL;
+    ULONG name_length = 0;
+    OBJECT_ATTRIBUTES attributes;
+    IO_STATUS_BLOCK io_status;
+    NTSTATUS status;
+
+    top = IoGetAttachedDeviceReference(FilterDevice);
+    if (top == FilterDevice) {
+        ObDereferenceObject(top);
+        return STATUS_DEVICE_NOT_READY; /* kbdclass is not attached yet */
+    }
+    status = ObQueryNameString(top, NULL, 0, &name_length);
+    if (status == STATUS_INFO_LENGTH_MISMATCH && name_length > sizeof(OBJECT_NAME_INFORMATION)) {
+        name = (POBJECT_NAME_INFORMATION)ExAllocatePool2(POOL_FLAG_PAGED, name_length, 'k0dW');
+        status = name == NULL ? STATUS_INSUFFICIENT_RESOURCES :
+            ObQueryNameString(top, name, name_length, &name_length);
+    } else if (NT_SUCCESS(status)) {
+        status = STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+    ObDereferenceObject(top);
+    if (NT_SUCCESS(status) && name->Name.Length == 0) {
+        status = STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+    if (NT_SUCCESS(status)) {
+        InitializeObjectAttributes(
+            &attributes,
+            &name->Name,
+            OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+            NULL,
+            NULL
+        );
+        status = ZwCreateFile(
+            Handle,
+            GENERIC_READ | SYNCHRONIZE,
+            &attributes,
+            &io_status,
+            NULL,
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN,
+            FILE_SYNCHRONOUS_IO_NONALERT,
+            NULL,
+            0
+        );
+        DbgPrint("Win0DoomDisplay: opened %wZ to enable the keyboard port: 0x%08lx\n",
+            &name->Name, (ULONG)status);
+    }
+    if (name != NULL) {
+        ExFreePoolWithTag(name, 'k0dW');
+    }
+    return status;
+}
+
+static VOID Win0DoomClassOpenWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
+{
+    PWIN0DOOM_FILTER_EXTENSION extension = (PWIN0DOOM_FILTER_EXTENSION)Context;
+    LARGE_INTEGER retry;
+    HANDLE handle = NULL;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+    retry.QuadPart = WIN0DOOM_CLASS_OPEN_RETRY_100NS;
+    /* The class device may still be starting when the connect arrives. */
+    for (ULONG attempt = 0;
+         attempt < WIN0DOOM_CLASS_OPEN_ATTEMPTS && extension->ClassOpenCancel == 0;
+         ++attempt) {
+        status = Win0DoomOpenClassAbove(DeviceObject, &handle);
+        if (NT_SUCCESS(status)) {
+            break;
+        }
+        KeDelayExecutionThread(KernelMode, FALSE, &retry);
+    }
+    if (NT_SUCCESS(status)) {
+        if (extension->ClassOpenCancel == 0 && extension->ClassHandle == NULL) {
+            extension->ClassHandle = handle;
+        } else {
+            ZwClose(handle);
+        }
+    }
+    KeSetEvent(&extension->ClassOpenIdle, IO_NO_INCREMENT, FALSE);
+}
+
+static VOID Win0DoomQueueClassOpen(PWIN0DOOM_FILTER_EXTENSION Extension)
+{
+    if (Extension->ClassOpenWorkItem == NULL ||
+        InterlockedCompareExchange(&Extension->ClassOpenQueued, 1, 0) != 0) {
+        return;
+    }
+    KeClearEvent(&Extension->ClassOpenIdle);
+    IoQueueWorkItem(
+        Extension->ClassOpenWorkItem,
+        Win0DoomClassOpenWorker,
+        DelayedWorkQueue,
+        Extension
+    );
+}
+
+/* PASSIVE_LEVEL only: stop the opener, then drop the handle it obtained. */
+static VOID Win0DoomReleaseClassHandle(PWIN0DOOM_FILTER_EXTENSION Extension)
+{
+    InterlockedExchange(&Extension->ClassOpenCancel, 1);
+    KeWaitForSingleObject(&Extension->ClassOpenIdle, Executive, KernelMode, FALSE, NULL);
+    if (Extension->ClassHandle != NULL) {
+        ZwClose(Extension->ClassHandle);
+        Extension->ClassHandle = NULL;
+    }
+    if (Extension->ClassOpenWorkItem != NULL) {
+        IoFreeWorkItem(Extension->ClassOpenWorkItem);
+        Extension->ClassOpenWorkItem = NULL;
+    }
+}
+
 static NTSTATUS Win0DoomInternalDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     PIO_STACK_LOCATION stack;
@@ -699,6 +847,7 @@ static NTSTATUS Win0DoomInternalDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP 
         if (!NT_SUCCESS(failure)) {
             return Win0DoomCompleteIrp(Irp, failure, 0);
         }
+        Win0DoomQueueClassOpen(extension);
     }
     return Win0DoomForwardIrp(DeviceObject, Irp);
 }
@@ -759,6 +908,7 @@ static NTSTATUS Win0DoomPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
      * can disappear. This is a real rundown, not just a flag check.
      */
     Win0DoomFilterSetDisconnected(extension);
+    Win0DoomReleaseClassHandle(extension);
     Win0DoomFilterWaitForCallbacks(extension);
 
     lower_device = extension->LowerDevice;
@@ -815,6 +965,9 @@ NTSTATUS Win0DoomAddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT PhysicalD
     }
     KeInitializeSpinLock(&extension->ConnectLock);
     ExInitializeRundownProtection(&extension->Rundown);
+    KeInitializeEvent(&extension->ClassOpenIdle, NotificationEvent, TRUE);
+    /* Without a work item doom still works whenever ccs holds the keyboard open. */
+    extension->ClassOpenWorkItem = IoAllocateWorkItem(filter_device);
     filter_device->Flags |= extension->LowerDevice->Flags &
         (DO_BUFFERED_IO | DO_DIRECT_IO | DO_POWER_PAGABLE);
     filter_device->Flags &= ~DO_DEVICE_INITIALIZING;
@@ -860,6 +1013,7 @@ static VOID Win0DoomDeleteDevices(PDRIVER_OBJECT DriverObject)
             PWIN0DOOM_FILTER_EXTENSION filter =
                 (PWIN0DOOM_FILTER_EXTENSION)device->DeviceExtension;
             Win0DoomFilterSetDisconnected(filter);
+            Win0DoomReleaseClassHandle(filter);
             Win0DoomFilterWaitForCallbacks(filter);
             if (filter->LowerDevice != NULL) {
                 IoDetachDevice(filter->LowerDevice);
