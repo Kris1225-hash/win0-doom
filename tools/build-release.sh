@@ -153,9 +153,9 @@ esac
 if command -v openssl >/dev/null; then
     leaf_issuer_cn="$(openssl pkcs12 -in "$pfx" -nokeys -passin "pass:$password" -nodes 2>/dev/null |
         openssl x509 -noout -issuer 2>/dev/null |
-        sed -n 's/.*CN=\(.*\)/\1/p')"
+        sed -n 's/.*CN *= *\([^,/]*\).*/\1/p')"
     cross_cn="$(openssl x509 -in "$cross_pem" -noout -subject 2>/dev/null |
-        sed -n 's/.*CN=\(.*\)/\1/p')"
+        sed -n 's/.*CN *= *\([^,/]*\).*/\1/p')"
     [[ -n "$leaf_issuer_cn" && -n "$cross_cn" ]] ||
         fail "cannot read the $pfx issuer or the cross certificate subject"
     [[ "$leaf_issuer_cn" == "$cross_cn" ]] ||
@@ -277,20 +277,28 @@ verify_signature() {
         fail "cannot extract the Authenticode signature from $signed_driver"
     command -v openssl >/dev/null ||
         fail 'openssl is required to verify the Authenticode signature independently'
-    if ! openssl smime -verify -inform DER -in "$signature_blob" -noverify -out /dev/null >/dev/null 2>&1; then
-        fail "the Authenticode signature does not verify against the signed attributes in $signed_driver"
+    # OpenSSL 3.0.x (e.g. Ubuntu 24.04) fails this check with "PKCS7_signatureVerify:
+    # digest failure" even for valid Authenticode signatures, whose content is
+    # SpcIndirectDataContent rather than plain data. WIN0DOOM_SKIP_SMIME_CHECK=1
+    # skips only this step after verifying the signature some other way; the
+    # summary below then says so instead of claiming the PKCS#7 check passed.
+    pkcs7_note='PKCS#7 signature verified'
+    if [[ "${WIN0DOOM_SKIP_SMIME_CHECK:-0}" == 1 ]]; then
+        pkcs7_note='PKCS#7 openssl check SKIPPED by WIN0DOOM_SKIP_SMIME_CHECK=1'
+    elif ! openssl smime -verify -inform DER -in "$signature_blob" -noverify -out /dev/null >/dev/null 2>&1; then
+        fail "the Authenticode signature does not verify against the signed attributes in $signed_driver (on OpenSSL 3.0.x this can be a false failure; see WIN0DOOM_SKIP_SMIME_CHECK)"
     fi
 
     signer_subject="$(awk '/Signer #0:/ { seen = 1 } seen && /Subject:/ {
         sub(/^.*Subject: */, ""); print; exit }' "$log")"
     [[ -n "$signer_subject" ]] || fail 'could not read the signer certificate subject'
-    signer_cn="$(printf '%s\n' "$signer_subject" | sed -n 's/.*CN=\(.*\)/\1/p')"
+    signer_cn="$(printf '%s\n' "$signer_subject" | sed -n 's/.*CN *= *\([^,/]*\).*/\1/p')"
     [[ -n "$signer_cn" ]] || fail "could not read CN from the signer subject: $signer_subject"
 
     if command -v openssl >/dev/null; then
         expected_cn="$(openssl pkcs12 -in "$pfx" -nokeys -passin "pass:$password" -nodes 2>/dev/null |
             openssl x509 -noout -subject 2>/dev/null |
-            sed -n 's/.*CN=\(.*\)/\1/p')"
+            sed -n 's/.*CN *= *\([^,/]*\).*/\1/p')"
         if [[ -n "$expected_cn" ]]; then
             [[ "$signer_cn" == "$expected_cn" ]] ||
                 fail "signed by CN=\"$signer_cn\", expected CN=\"$expected_cn\""
@@ -318,7 +326,7 @@ verify_signature() {
         fail 'osslsigncode verify reported unexpected errors'
     fi
 
-    signature_status="ok (sha256 digest and PKCS#7 signature verified; signer CN \"$signer_cn\"; WDK test chain trusted by Windows only)"
+    signature_status="ok (sha256 digest and $pkcs7_note; signer CN \"$signer_cn\"; WDK test chain trusted by Windows only)"
 }
 
 # ---------------------------------------------------------------------------
