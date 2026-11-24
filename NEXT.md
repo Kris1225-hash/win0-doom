@@ -73,12 +73,27 @@ built by `tools/build-vm-image.sh` instead set the session manager's
   when it launches `CcsCommand` nobody opens the keyboard.
 - sending `IOCTL_INTERNAL_KEYBOARD_ENABLE` down the stack is not a fix:
   i8042prt answers `STATUS_INVALID_DEVICE_REQUEST` (`0xc0000010`).
-- the filter now queues a work item after `IOCTL_INTERNAL_KEYBOARD_CONNECT`
-  that opens the class device attached above it and keeps that kernel handle
-  until removal or unload. it never reads, so it does not compete with ccs.
+- after the port accepts `IOCTL_INTERNAL_KEYBOARD_CONNECT`, the filter queues
+  a work item that opens the class device named in kbdclass's `CONNECT_DATA`
+  and keeps that kernel handle. it never reads, so it does not compete with
+  ccs. a target-device pnp notification closes it on query-remove and
+  remove-complete (an open handle would veto removal or stall surprise
+  removal) and reopens it if the removal is cancelled; surprise removal,
+  removal and unload close it as a last resort.
 - verified on a `CcsCommand` image (escape menu, new game, w walks into the
-  blue-floor room, held control fires, ammo 50 to 49) and on the same image
-  with `CcsCommand` removed (ccs answers `TLIST`, then the manual launch plays).
+  blue-floor room, held control fires, ammo 50 to 47 over three shots) and on
+  the same image with `CcsCommand` removed (ccs answers `TLIST`, then the
+  manual launch plays).
+
+pre-existing behaviour seen while testing, unchanged by the fix:
+
+- on a `CcsCommand` image, ccs bugchecks the vm with stop code `0xc0000481`
+  (`STATUS_APISET_NOT_HOSTED`) as soon as the launched program exits, so
+  quitting doom (f10, y) restarts the vm. the same stop code appears with the
+  original driver when `CcsCommand` names a program that does not exist.
+- after a manual launch, keys pressed in doom are also queued for ccs and
+  replay at its prompt once doom exits; ccs holds the keyboard open the
+  whole time. identical with the original driver.
 
 ## audio development record
 
