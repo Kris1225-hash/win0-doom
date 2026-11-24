@@ -58,6 +58,43 @@ injection:
 the vm survived two cold boots with the filter installed and showed no
 bugcheck.
 
+## auto-launch keeps the port enabled
+
+the proven test above launched doom by hand from the ccs prompt. images
+built by `tools/build-vm-image.sh` instead set the session manager's
+`CcsCommand`, and there doom rendered but never received a key.
+
+- measured with temporary counters in the driver log: the filter attached
+  and connected, irq 1 fired for every injected key, yet the service callback
+  ran zero times. the same image with `CcsCommand` removed delivered every key
+  typed at the ccs prompt.
+- i8042prt only queues input while a handle to the keyboard stack is open
+  (kbdclass forwards create/close to the port). ccs holds one at its prompt;
+  when it launches `CcsCommand` nobody opens the keyboard.
+- sending `IOCTL_INTERNAL_KEYBOARD_ENABLE` down the stack is not a fix:
+  i8042prt answers `STATUS_INVALID_DEVICE_REQUEST` (`0xc0000010`).
+- after the port accepts `IOCTL_INTERNAL_KEYBOARD_CONNECT`, the filter queues
+  a work item that opens the class device named in kbdclass's `CONNECT_DATA`
+  and keeps that kernel handle. it never reads, so it does not compete with
+  ccs. a target-device pnp notification closes it on query-remove and
+  remove-complete (an open handle would veto removal or stall surprise
+  removal) and reopens it if the removal is cancelled; surprise removal,
+  removal and unload close it as a last resort.
+- verified on a `CcsCommand` image (escape menu, new game, w walks into the
+  blue-floor room, held control fires, ammo 50 to 47 over three shots) and on
+  the same image with `CcsCommand` removed (ccs answers `TLIST`, then the
+  manual launch plays).
+
+pre-existing behaviour seen while testing, unchanged by the fix:
+
+- on a `CcsCommand` image, ccs bugchecks the vm with stop code `0xc0000481`
+  (`STATUS_APISET_NOT_HOSTED`) as soon as the launched program exits, so
+  quitting doom (f10, y) restarts the vm. the same stop code appears with the
+  original driver when `CcsCommand` names a program that does not exist.
+- after a manual launch, keys pressed in doom are also queued for ccs and
+  replay at its prompt once doom exits; ccs holds the keyboard open the
+  whole time. identical with the original driver.
+
 ## audio development record
 
 ### observations

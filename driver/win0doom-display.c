@@ -1,5 +1,7 @@
 #include <ntddk.h>
 #include <kbdmou.h>
+#include <initguid.h>
+#include <wdmguid.h>
 
 #include "win0doom-audio.h"
 
@@ -119,10 +121,33 @@ typedef struct _WIN0DOOM_FILTER_EXTENSION {
     BOOLEAN Connected;
     BOOLEAN Disconnected;
     BOOLEAN RundownWaited;
+    /* Keyboard-port enable handle; see Win0DoomOpenClassDevice. */
+    PDEVICE_OBJECT Self;
+    PIO_WORKITEM ClassOpenWorkItem;   /* ConnectLock; the queued item, freed by its worker */
+    KEVENT ClassOpenIdle;             /* signaled while the opener is not queued */
+    KEVENT ClassOpenCancelEvent;      /* signaled once teardown starts */
+    BOOLEAN ClassOpenQueued;          /* ConnectLock */
+    BOOLEAN ClassOpenCancel;          /* ConnectLock */
+    KEVENT ClassHandleLock;           /* synchronization event used as a PASSIVE lock */
+    HANDLE ClassHandle;               /* ClassHandleLock */
+    PVOID ClassNotifyEntry;           /* ClassHandleLock */
 } WIN0DOOM_FILTER_EXTENSION, *PWIN0DOOM_FILTER_EXTENSION;
 
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_ADD_DEVICE Win0DoomAddDevice;
+
+/* Exported by ntoskrnl.exe; declared in ntifs.h, which ntddk.h does not include. */
+NTKERNELAPI NTSTATUS ObQueryNameString(
+    PVOID Object,
+    POBJECT_NAME_INFORMATION ObjectNameInfo,
+    ULONG Length,
+    PULONG ReturnLength
+);
+
+static IO_WORKITEM_ROUTINE Win0DoomClassOpenWorker;
+
+#define WIN0DOOM_CLASS_OPEN_ATTEMPTS 100UL
+#define WIN0DOOM_CLASS_OPEN_RETRY_100NS (-1000000LL) /* 100 ms */
 
 static PWIN0DOOM_CONTROL_EXTENSION g_ControlExtension;
 static EX_RUNDOWN_REF g_ControlRundown;
@@ -662,6 +687,291 @@ static NTSTATUS Win0DoomDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     return Win0DoomCompleteIrp(Irp, STATUS_SUCCESS, 0);
 }
 
+/*
+ * i8042prt only queues keyboard input while a handle to the keyboard stack is
+ * open: kbdclass forwards IRP_MJ_CREATE/IRP_MJ_CLOSE to the port, which keeps
+ * an enable count. ccs holds such a handle while it sits at its interactive
+ * prompt, but when the session manager's CcsCommand value makes ccs launch
+ * win0doom.exe directly, nobody opens the keyboard. The port then drops every
+ * scan code, the service callback below never runs, and doom renders with no
+ * input. Measured in a CcsCommand image: the filter attached and connected,
+ * IRQ 1 fired for every key, yet zero service callbacks; the same image with
+ * CcsCommand removed delivered every key typed at the ccs prompt. Sending
+ * IOCTL_INTERNAL_KEYBOARD_ENABLE instead is not an option: i8042prt fails it
+ * with STATUS_INVALID_DEVICE_REQUEST.
+ *
+ * So once the class driver has connected, a work item opens that class
+ * device (the one named in its CONNECT_DATA) and keeps the kernel handle. The
+ * handle is never read from, so it does not compete with ccs for input; it
+ * only keeps the port's enable count non-zero. A target-device PnP
+ * notification closes it on query-remove and remove-complete (an open handle
+ * would otherwise veto removal or stall surprise removal) and reopens it if
+ * the removal is cancelled. Removal and unload close it as a last resort.
+ */
+static VOID Win0DoomLockClassHandle(PWIN0DOOM_FILTER_EXTENSION Extension)
+{
+    KeWaitForSingleObject(&Extension->ClassHandleLock, Executive, KernelMode, FALSE, NULL);
+}
+
+static VOID Win0DoomUnlockClassHandle(PWIN0DOOM_FILTER_EXTENSION Extension)
+{
+    KeSetEvent(&Extension->ClassHandleLock, IO_NO_INCREMENT, FALSE);
+}
+
+static BOOLEAN Win0DoomSameGuid(const GUID *Left, const GUID *Right)
+{
+    return RtlCompareMemory(Left, Right, sizeof(GUID)) == sizeof(GUID);
+}
+
+static VOID Win0DoomQueueClassOpenLocked(PWIN0DOOM_FILTER_EXTENSION Extension)
+{
+    /* ConnectLock held: teardown sets ClassOpenCancel under the same lock. */
+    PIO_WORKITEM item;
+
+    if (!Extension->Connected || Extension->ClassOpenQueued || Extension->ClassOpenCancel) {
+        return;
+    }
+    /*
+     * One work item per queueing, freed by the worker itself: the I/O manager
+     * still touches an item after its routine returns, so teardown must never
+     * free one. Without an item doom still works whenever ccs holds the
+     * keyboard open.
+     */
+    item = IoAllocateWorkItem(Extension->Self);
+    if (item == NULL) {
+        return;
+    }
+    Extension->ClassOpenWorkItem = item;
+    Extension->ClassOpenQueued = TRUE;
+    KeClearEvent(&Extension->ClassOpenIdle);
+    IoQueueWorkItem(
+        item,
+        Win0DoomClassOpenWorker,
+        DelayedWorkQueue,
+        Extension
+    );
+}
+
+static VOID Win0DoomQueueClassOpen(PWIN0DOOM_FILTER_EXTENSION Extension)
+{
+    KIRQL old_irql;
+
+    KeAcquireSpinLock(&Extension->ConnectLock, &old_irql);
+    Win0DoomQueueClassOpenLocked(Extension);
+    KeReleaseSpinLock(&Extension->ConnectLock, old_irql);
+}
+
+static NTSTATUS Win0DoomOpenClassDevice(PDEVICE_OBJECT ClassDevice, PHANDLE Handle)
+{
+    POBJECT_NAME_INFORMATION name = NULL;
+    ULONG name_length = 0;
+    OBJECT_ATTRIBUTES attributes;
+    IO_STATUS_BLOCK io_status;
+    NTSTATUS status;
+
+    status = ObQueryNameString(ClassDevice, NULL, 0, &name_length);
+    if (status != STATUS_INFO_LENGTH_MISMATCH || name_length <= sizeof(OBJECT_NAME_INFORMATION)) {
+        return STATUS_OBJECT_NAME_NOT_FOUND; /* an unnamed device cannot be opened */
+    }
+    name = (POBJECT_NAME_INFORMATION)ExAllocatePool2(POOL_FLAG_PAGED, name_length, 'k0dW');
+    if (name == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    status = ObQueryNameString(ClassDevice, name, name_length, &name_length);
+    if (NT_SUCCESS(status) && name->Name.Length == 0) {
+        status = STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+    if (NT_SUCCESS(status)) {
+        InitializeObjectAttributes(
+            &attributes,
+            &name->Name,
+            OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+            NULL,
+            NULL
+        );
+        status = ZwCreateFile(
+            Handle,
+            GENERIC_READ | SYNCHRONIZE,
+            &attributes,
+            &io_status,
+            NULL,
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN,
+            FILE_SYNCHRONOUS_IO_NONALERT,
+            NULL,
+            0
+        );
+        DbgPrint("Win0DoomDisplay: opened %wZ to enable the keyboard port: 0x%08lx\n",
+            &name->Name, (ULONG)status);
+    }
+    ExFreePoolWithTag(name, 'k0dW');
+    return status;
+}
+
+static NTSTATUS Win0DoomClassNotify(PVOID NotificationStructure, PVOID Context)
+{
+    PTARGET_DEVICE_REMOVAL_NOTIFICATION notification =
+        (PTARGET_DEVICE_REMOVAL_NOTIFICATION)NotificationStructure;
+    PWIN0DOOM_FILTER_EXTENSION extension = (PWIN0DOOM_FILTER_EXTENSION)Context;
+    BOOLEAN query = Win0DoomSameGuid(&notification->Event, &GUID_TARGET_DEVICE_QUERY_REMOVE);
+    BOOLEAN complete = Win0DoomSameGuid(&notification->Event, &GUID_TARGET_DEVICE_REMOVE_COMPLETE);
+    HANDLE handle = NULL;
+    PVOID entry = NULL;
+
+    if (query || complete) {
+        Win0DoomLockClassHandle(extension);
+        handle = extension->ClassHandle;
+        extension->ClassHandle = NULL;
+        if (complete) {
+            entry = extension->ClassNotifyEntry;
+            extension->ClassNotifyEntry = NULL;
+        }
+        Win0DoomUnlockClassHandle(extension);
+        if (handle != NULL) {
+            ZwClose(handle);
+        }
+        if (entry != NULL) {
+            /* The Ex form may be called from inside the callback. */
+            IoUnregisterPlugPlayNotificationEx(entry);
+        }
+    } else if (Win0DoomSameGuid(&notification->Event, &GUID_TARGET_DEVICE_REMOVE_CANCELLED)) {
+        Win0DoomQueueClassOpen(extension);
+    }
+    return STATUS_SUCCESS;
+}
+
+static VOID Win0DoomAdoptClassHandle(
+    PWIN0DOOM_FILTER_EXTENSION Extension,
+    PDRIVER_OBJECT DriverObject,
+    HANDLE Handle
+)
+{
+    PFILE_OBJECT file;
+    PVOID entry = NULL;
+    NTSTATUS status;
+
+    Win0DoomLockClassHandle(Extension);
+    if (Extension->ClassOpenCancel || Extension->ClassHandle != NULL) {
+        Win0DoomUnlockClassHandle(Extension);
+        ZwClose(Handle);
+        return;
+    }
+    Extension->ClassHandle = Handle;
+    if (Extension->ClassNotifyEntry == NULL &&
+        NT_SUCCESS(ObReferenceObjectByHandle(
+            Handle, 0, *IoFileObjectType, KernelMode, (PVOID *)&file, NULL))) {
+        status = IoRegisterPlugPlayNotification(
+            EventCategoryTargetDeviceChange,
+            0,
+            file,
+            DriverObject,
+            Win0DoomClassNotify,
+            Extension,
+            &entry
+        );
+        /* Registration does not need the file object afterwards. */
+        ObDereferenceObject(file);
+        if (NT_SUCCESS(status)) {
+            Extension->ClassNotifyEntry = entry;
+        } else {
+            DbgPrint("Win0DoomDisplay: keyboard removal notification failed 0x%08lx\n",
+                (ULONG)status);
+        }
+    }
+    Win0DoomUnlockClassHandle(Extension);
+}
+
+static VOID Win0DoomClassOpenWorker(PDEVICE_OBJECT DeviceObject, PVOID Context)
+{
+    PWIN0DOOM_FILTER_EXTENSION extension = (PWIN0DOOM_FILTER_EXTENSION)Context;
+    LARGE_INTEGER retry;
+    HANDLE handle = NULL;
+    NTSTATUS status = STATUS_CANCELLED;
+    KIRQL old_irql;
+    PIO_WORKITEM item;
+
+    retry.QuadPart = WIN0DOOM_CLASS_OPEN_RETRY_100NS;
+    /* The class device may still be starting when the connect arrives. */
+    for (ULONG attempt = 0; attempt < WIN0DOOM_CLASS_OPEN_ATTEMPTS; ++attempt) {
+        PDEVICE_OBJECT class_device = NULL;
+        BOOLEAN cancelled;
+
+        KeAcquireSpinLock(&extension->ConnectLock, &old_irql);
+        cancelled = extension->ClassOpenCancel;
+        if (!cancelled) {
+            class_device = extension->UpperConnectData.ClassDeviceObject;
+            if (class_device != NULL) {
+                ObReferenceObject(class_device);
+            }
+        }
+        KeReleaseSpinLock(&extension->ConnectLock, old_irql);
+        if (cancelled) {
+            status = STATUS_CANCELLED;
+            break;
+        }
+        status = class_device == NULL ? STATUS_DEVICE_NOT_READY :
+            Win0DoomOpenClassDevice(class_device, &handle);
+        if (class_device != NULL) {
+            ObDereferenceObject(class_device);
+        }
+        if (NT_SUCCESS(status) || status == STATUS_OBJECT_NAME_NOT_FOUND) {
+            break;
+        }
+        if (attempt + 1 < WIN0DOOM_CLASS_OPEN_ATTEMPTS &&
+            KeWaitForSingleObject(&extension->ClassOpenCancelEvent, Executive,
+                KernelMode, FALSE, &retry) == STATUS_SUCCESS) {
+            status = STATUS_CANCELLED;
+            break;
+        }
+    }
+    if (NT_SUCCESS(status)) {
+        Win0DoomAdoptClassHandle(extension, DeviceObject->DriverObject, handle);
+    }
+
+    KeAcquireSpinLock(&extension->ConnectLock, &old_irql);
+    item = extension->ClassOpenWorkItem;
+    extension->ClassOpenWorkItem = NULL;
+    extension->ClassOpenQueued = FALSE;
+    KeSetEvent(&extension->ClassOpenIdle, IO_NO_INCREMENT, FALSE);
+    KeReleaseSpinLock(&extension->ConnectLock, old_irql);
+    /*
+     * The extension may be gone once ClassOpenIdle is signaled; the item is
+     * separate pool and keeps the device object referenced until this routine
+     * returns, so freeing it here is safe.
+     */
+    IoFreeWorkItem(item);
+}
+
+/* PASSIVE_LEVEL only. Idempotent: stops the opener and drops the handle. */
+static VOID Win0DoomReleaseClassHandle(PWIN0DOOM_FILTER_EXTENSION Extension)
+{
+    KIRQL old_irql;
+    HANDLE handle;
+    PVOID entry;
+
+    KeAcquireSpinLock(&Extension->ConnectLock, &old_irql);
+    Extension->ClassOpenCancel = TRUE;
+    KeReleaseSpinLock(&Extension->ConnectLock, old_irql);
+    KeSetEvent(&Extension->ClassOpenCancelEvent, IO_NO_INCREMENT, FALSE);
+    KeWaitForSingleObject(&Extension->ClassOpenIdle, Executive, KernelMode, FALSE, NULL);
+
+    Win0DoomLockClassHandle(Extension);
+    handle = Extension->ClassHandle;
+    Extension->ClassHandle = NULL;
+    entry = Extension->ClassNotifyEntry;
+    Extension->ClassNotifyEntry = NULL;
+    Win0DoomUnlockClassHandle(Extension);
+
+    /* Unregister outside the lock: it waits for a running callback. */
+    if (entry != NULL) {
+        IoUnregisterPlugPlayNotificationEx(entry);
+    }
+    if (handle != NULL) {
+        ZwClose(handle);
+    }
+}
+
 static NTSTATUS Win0DoomInternalDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     PIO_STACK_LOCATION stack;
@@ -699,6 +1009,12 @@ static NTSTATUS Win0DoomInternalDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP 
         if (!NT_SUCCESS(failure)) {
             return Win0DoomCompleteIrp(Irp, failure, 0);
         }
+        /* Let the port see the connect first; open only if it accepted it. */
+        failure = Win0DoomForwardIrp(DeviceObject, Irp);
+        if (NT_SUCCESS(failure)) {
+            Win0DoomQueueClassOpen(extension);
+        }
+        return failure;
     }
     return Win0DoomForwardIrp(DeviceObject, Irp);
 }
@@ -748,6 +1064,7 @@ static NTSTATUS Win0DoomPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
          * them with the rundown before detaching.
          */
         Win0DoomFilterSetDisconnected(extension);
+        Win0DoomReleaseClassHandle(extension);
         return Win0DoomForwardIrp(DeviceObject, Irp);
     }
     if (stack->MinorFunction != IRP_MN_REMOVE_DEVICE) {
@@ -759,6 +1076,7 @@ static NTSTATUS Win0DoomPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
      * can disappear. This is a real rundown, not just a flag check.
      */
     Win0DoomFilterSetDisconnected(extension);
+    Win0DoomReleaseClassHandle(extension);
     Win0DoomFilterWaitForCallbacks(extension);
 
     lower_device = extension->LowerDevice;
@@ -815,6 +1133,10 @@ NTSTATUS Win0DoomAddDevice(PDRIVER_OBJECT DriverObject, PDEVICE_OBJECT PhysicalD
     }
     KeInitializeSpinLock(&extension->ConnectLock);
     ExInitializeRundownProtection(&extension->Rundown);
+    KeInitializeEvent(&extension->ClassOpenIdle, NotificationEvent, TRUE);
+    KeInitializeEvent(&extension->ClassOpenCancelEvent, NotificationEvent, FALSE);
+    KeInitializeEvent(&extension->ClassHandleLock, SynchronizationEvent, TRUE);
+    extension->Self = filter_device;
     filter_device->Flags |= extension->LowerDevice->Flags &
         (DO_BUFFERED_IO | DO_DIRECT_IO | DO_POWER_PAGABLE);
     filter_device->Flags &= ~DO_DEVICE_INITIALIZING;
@@ -860,6 +1182,7 @@ static VOID Win0DoomDeleteDevices(PDRIVER_OBJECT DriverObject)
             PWIN0DOOM_FILTER_EXTENSION filter =
                 (PWIN0DOOM_FILTER_EXTENSION)device->DeviceExtension;
             Win0DoomFilterSetDisconnected(filter);
+            Win0DoomReleaseClassHandle(filter);
             Win0DoomFilterWaitForCallbacks(filter);
             if (filter->LowerDevice != NULL) {
                 IoDetachDevice(filter->LowerDevice);

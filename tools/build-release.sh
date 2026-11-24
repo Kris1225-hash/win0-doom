@@ -40,7 +40,11 @@
 # the signed overlay, an independent PKCS#7 signature check with `openssl
 # smime -verify -noverify` (OpenSSL's PKCS7_verify aborts at the chain before
 # touching the RSA signature), and the signer to be the certificate from the
-# pfx; a chain failure is tolerated only when OpenSSL fails for that specific
+# pfx.  OpenSSL 3.0.x rejects every valid Authenticode signature in that smime
+# step ("digest failure": the content is SpcIndirectDataContent, not data), so
+# when it fails the same two checks are repeated by tools/verify-authenticode.py
+# (python3 + the `cryptography` package) and either one passing is required; a
+# chain failure is tolerated only when OpenSSL fails for that specific
 # trust-anchor reason and nothing else.  Any other error, a digest or
 # checksum mismatch, a missing signature, or a different signer fails the
 # build.  The pfx is a local build input that ships with the extracted SDK:
@@ -150,12 +154,21 @@ case "$intermediate" in
     *) cross_pem="$work_dir/intermediate.pem"; to_pem "$intermediate" >"$cross_pem" ;;
 esac
 
+# First CN field of an OpenSSL or osslsigncode name line.  Handles
+# "issuer=C = US, ..., CN = name" (OpenSSL >= 1.1), "/C=US/.../CN=name"
+# (older OpenSSL) and "CN=name,O=..." (RFC 2253, osslsigncode 2.17).  CN must
+# start a field, so a value such as "OU=MyCN=x" never matches.
+cn_of() {
+    grep -oE '(^|[,/=])[[:space:]]*CN[[:space:]]*=[[:space:]]*[^,/]*' | head -n 1 |
+        sed -E 's/^[,/=]?[[:space:]]*CN[[:space:]]*=[[:space:]]*//; s/[[:space:]]+$//'
+}
+
 if command -v openssl >/dev/null; then
     leaf_issuer_cn="$(openssl pkcs12 -in "$pfx" -nokeys -passin "pass:$password" -nodes 2>/dev/null |
         openssl x509 -noout -issuer 2>/dev/null |
-        sed -n 's/.*CN=\(.*\)/\1/p')"
+        cn_of)"
     cross_cn="$(openssl x509 -in "$cross_pem" -noout -subject 2>/dev/null |
-        sed -n 's/.*CN=\(.*\)/\1/p')"
+        cn_of)"
     [[ -n "$leaf_issuer_cn" && -n "$cross_cn" ]] ||
         fail "cannot read the $pfx issuer or the cross certificate subject"
     [[ "$leaf_issuer_cn" == "$cross_cn" ]] ||
@@ -277,20 +290,30 @@ verify_signature() {
         fail "cannot extract the Authenticode signature from $signed_driver"
     command -v openssl >/dev/null ||
         fail 'openssl is required to verify the Authenticode signature independently'
+    # OpenSSL 3.0.x (e.g. Ubuntu 24.04) fails this step with "PKCS7_signatureVerify:
+    # digest failure" even for valid Authenticode signatures, whose content is
+    # SpcIndirectDataContent rather than plain data.  Repeat the same checks
+    # (messageDigest and the RSA signature over the signed attributes) with
+    # tools/verify-authenticode.py before failing; never skip them.
+    local pkcs7_note='PKCS#7 signature verified'
     if ! openssl smime -verify -inform DER -in "$signature_blob" -noverify -out /dev/null >/dev/null 2>&1; then
-        fail "the Authenticode signature does not verify against the signed attributes in $signed_driver"
+        if python3 "$repo_dir/tools/verify-authenticode.py" "$signature_blob" >"$work_dir/verify-authenticode.log" 2>&1; then
+            pkcs7_note='PKCS#7 signature verified by tools/verify-authenticode.py (openssl smime cannot check it here)'
+        else
+            fail "the Authenticode signature does not verify against the signed attributes in $signed_driver: $(cat "$work_dir/verify-authenticode.log")"
+        fi
     fi
 
     signer_subject="$(awk '/Signer #0:/ { seen = 1 } seen && /Subject:/ {
         sub(/^.*Subject: */, ""); print; exit }' "$log")"
     [[ -n "$signer_subject" ]] || fail 'could not read the signer certificate subject'
-    signer_cn="$(printf '%s\n' "$signer_subject" | sed -n 's/.*CN=\(.*\)/\1/p')"
+    signer_cn="$(printf '%s\n' "$signer_subject" | cn_of)"
     [[ -n "$signer_cn" ]] || fail "could not read CN from the signer subject: $signer_subject"
 
     if command -v openssl >/dev/null; then
         expected_cn="$(openssl pkcs12 -in "$pfx" -nokeys -passin "pass:$password" -nodes 2>/dev/null |
             openssl x509 -noout -subject 2>/dev/null |
-            sed -n 's/.*CN=\(.*\)/\1/p')"
+            cn_of)"
         if [[ -n "$expected_cn" ]]; then
             [[ "$signer_cn" == "$expected_cn" ]] ||
                 fail "signed by CN=\"$signer_cn\", expected CN=\"$expected_cn\""
@@ -318,7 +341,7 @@ verify_signature() {
         fail 'osslsigncode verify reported unexpected errors'
     fi
 
-    signature_status="ok (sha256 digest and PKCS#7 signature verified; signer CN \"$signer_cn\"; WDK test chain trusted by Windows only)"
+    signature_status="ok (sha256 digest and $pkcs7_note; signer CN \"$signer_cn\"; WDK test chain trusted by Windows only)"
 }
 
 # ---------------------------------------------------------------------------
